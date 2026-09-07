@@ -256,6 +256,81 @@ make baseline-update  # Record latest eval as the new baseline
 
 Regression thresholds are defined per metric; the `check_regression` tool alerts on statistically significant degradation.
 
+## Portfolio and interview guide
+
+This repository is designed to be read as an engineering case study, not just as a demo chatbot. Its strongest story is the complete path from untrusted documents to an answer whose evidence is explicit, inspectable, and evaluated.
+
+### 30-second project pitch
+
+> AskMyDocs is a grounded RAG service for technical documentation. It parses mixed-format documents, creates deterministic chunks, retrieves evidence with both dense vector search and BM25, fuses and reranks candidates, generates structured answers, and validates citations at the claim level. The system includes mockable dependencies, regression-aware evaluation, API tests, and production-oriented observability so quality can be measured instead of assumed.
+
+### What this project demonstrates
+
+| Engineering signal | Evidence in the repository |
+|---------------------|----------------------------|
+| Retrieval quality | Qdrant vector search, OpenSearch BM25, reciprocal-rank fusion, reranking, evidence selection |
+| Reliability | Deterministic chunk IDs, content hashes, typed schemas, retry handling, safe refusals |
+| Model discipline | Lazy model loading, injectable embedders and LLMs, dimension checks, mock mode |
+| Grounded generation | Structured JSON output, inline citations, claim extraction, citation validation, grounding status |
+| Evaluation thinking | Golden dataset, retrieval metrics, citation metrics, Ragas adapter, baselines, regression checks |
+| Product engineering | FastAPI routes, document ingestion, request IDs, health/readiness endpoints, persistence |
+| Operational awareness | Docker Compose services, structured logging, tracing abstraction, CI workflows, benchmark reports |
+| Testing maturity | Unit, integration, API, storage, retrieval, generation, grounding, and evaluation tests |
+
+### Recommended interview walkthrough
+
+Use this order when presenting the project:
+
+1. Start with the failure mode: a fluent answer is not necessarily a correct answer, so the system must retrieve evidence and make unsupported claims visible.
+2. Show ingestion: parsers preserve source metadata, the cleaner removes noise, and the chunker produces stable IDs such as `authentication-guide:2`.
+3. Explain why retrieval is hybrid: BM25 catches exact identifiers, error codes, and configuration names; embeddings catch paraphrases and semantic matches.
+4. Explain RRF and reranking: the system combines complementary candidate lists, then uses a cross-encoder to improve ordering before context is selected.
+5. Show the answer contract: the LLM returns structured data with `[C1]` markers rather than an opaque string.
+6. Show grounding: claims are checked against cited chunks, and the system can return `grounded`, `partially_grounded`, `ungrounded`, or `refused`.
+7. Finish with evaluation: the golden dataset and regression checks make retrieval and grounding changes measurable.
+
+### Questions this project should answer clearly
+
+- Why use BM25 and embeddings together?
+- Why use reciprocal-rank fusion instead of adding raw scores?
+- Why rerank only a small candidate pool?
+- How are duplicate chunks and repeated documents handled?
+- What happens when the LLM returns malformed JSON?
+- How does the system behave when evidence is insufficient?
+- How can a citation be wrong even when the answer sounds plausible?
+- How do you test the system without downloading models or calling a paid API?
+- Which metrics reveal retrieval failure versus generation failure?
+- What are the latency and cost trade-offs of claim-level validation?
+- How would you scale ingestion and query traffic independently?
+- What would you change for multi-tenant data isolation and access control?
+
+### Resume-ready bullets
+
+Adapt these only after confirming the implementation and measured results in your own environment:
+
+- Built a production-oriented RAG service for mixed-format technical documentation using FastAPI, PostgreSQL, Qdrant, OpenSearch, sentence-transformer embeddings, and an OpenAI-compatible LLM client.
+- Implemented hybrid retrieval with BM25, dense vector search, reciprocal-rank fusion, cross-encoder reranking, and token-budgeted evidence selection.
+- Designed claim-level citation validation with structured outputs, deterministic fallbacks, safe refusal behavior, and explicit groundedness states.
+- Created a deterministic evaluation framework with a golden question set, retrieval/citation metrics, mock LLM execution, benchmark reports, and regression baselines.
+- Added API, storage, retrieval, generation, grounding, and evaluation tests so the system can be developed without live model calls or external service access.
+
+Do not claim latency, accuracy, scale, cost savings, or production usage unless those numbers are recorded in `evals/reports/benchmark.md` or another reproducible report.
+
+### Final portfolio checklist
+
+Before sharing this repository:
+
+- Replace placeholder configuration values and remove all secrets from commits.
+- Run the full test suite and record the result.
+- Run linting and type checking.
+- Run a mock evaluation and commit only reproducible reports.
+- Run a live evaluation only when the API key and model usage are authorized.
+- Review the README commands from a clean virtual environment.
+- Add a short architecture diagram or recorded demo if the repository is being used in an application.
+- Be ready to discuss one failure, one trade-off, and one improvement you would make next.
+
+This section is portfolio guidance, not official OpenAI hiring guidance. Hiring decisions depend on the role, interview performance, and the broader evidence of a candidate's work.
+
 ## Limitations
 
 - **Corpus freshness**: Ingested documents are snapshotted at ingest time; updates require re-ingestion.
