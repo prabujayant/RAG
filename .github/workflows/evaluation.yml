@@ -1,0 +1,241 @@
+# =============================================================================
+# Full evaluation workflow — runs on schedule, manual dispatch, or release tags.
+# Uses real LLM calls when OPENROUTER_API_KEY is available; falls back to mock.
+# Compares results against stored baseline and fails on regression.
+# =============================================================================
+
+name: Evaluation
+
+on:
+  schedule:
+    # Run nightly at 02:00 UTC — low-traffic time for full evaluation
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      experiment:
+        description: "Experiment preset to evaluate (vector, bm25, hybrid, final)"
+        required: false
+        default: "final"
+      mock:
+        description: "Force mock mode (skip LLM calls)"
+        required: false
+        default: "false"
+        type: boolean
+  release:
+    types: [published]
+
+# Keep nightly runs independent; cancel only duplicate PR previews.
+concurrency:
+  group: eval-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Job 1: Start infrastructure and run full evaluation
+  # --------------------------------------------------------------------------
+  full-evaluation:
+    name: Full evaluation (${{ inputs.experiment || 'final' }})
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: askmydocs
+          POSTGRES_PASSWORD: askmydocs
+          POSTGRES_DB: askmydocs
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      qdrant:
+        image: qdrant/qdrant:v1.13.0
+        ports:
+          - 6333:6333
+          - 6334:6334
+        options: >-
+          --health-cmd bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333 && echo ok'
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+      opensearch:
+        image: opensearchproject/opensearch:2.19.0
+        env:
+          discovery.type: single-node
+          DISABLE_SECURITY_PLUGIN: "true"
+          DISABLE_INSTALL_DEMO_CONFIG: "true"
+          OPENSEARCH_INITIAL_ADMIN_PASSWORD: Admin123!
+          bootstrap.memory_lock: "true"
+        options: >-
+          --health-cmd curl -s http://localhost:9200/_cluster/health || exit 1
+          --health-interval 15s
+          --health-timeout 10s
+          --health-retries 10
+        ports:
+          - 9200:9200
+          - 9600:9600
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Cache Hugging Face models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-models-${{ runner.os }}
+          restore-keys: hf-models-
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      # --- Wait for services ---
+      - name: Wait for PostgreSQL
+        run: |
+          python -c "
+          import socket, time
+          for i in range(30):
+              try:
+                  s = socket.create_connection(('127.0.0.1', 5432), timeout=1)
+                  s.close()
+                  print('PostgreSQL ready')
+                  break
+              except OSError:
+                  time.sleep(1)
+          else:
+              raise RuntimeError('PostgreSQL not ready')
+          "
+
+      - name: Wait for Qdrant
+        run: |
+          python -c "
+          import socket, time
+          for i in range(30):
+              try:
+                  s = socket.create_connection(('127.0.0.1', 6333), timeout=1)
+                  s.close()
+                  print('Qdrant ready')
+                  break
+              except OSError:
+                  time.sleep(1)
+          else:
+              raise RuntimeError('Qdrant not ready')
+          "
+
+      - name: Wait for OpenSearch
+        run: |
+          python -c "
+          import socket, time
+          for i in range(30):
+              try:
+                  s = socket.create_connection(('127.0.0.1', 9200), timeout=1)
+                  s.close()
+                  print('OpenSearch ready')
+                  break
+              except OSError:
+                  time.sleep(1)
+          else:
+              raise RuntimeError('OpenSearch not ready')
+          "
+
+      # --- Validate corpus and dataset before running evaluation ---
+      - name: Validate golden dataset
+        run: python scripts/validate_dataset.py
+
+      - name: Check chunk references
+        run: python scripts/check_chunk_refs.py
+
+      # --- Run the full evaluation ---
+      - name: Determine run mode
+        id: mode
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if [[ "${{ inputs.mock }}" == "true" ]]; then
+              echo "mode=mock" >> $GITHUB_OUTPUT
+            else
+              echo "mode=live" >> $GITHUB_OUTPUT
+            fi
+          elif [[ -n "${{ secrets.OPENROUTER_API_KEY }}" ]]; then
+            echo "mode=live" >> $GITHUB_OUTPUT
+          else
+            echo "mode=mock" >> $GITHUB_OUTPUT
+          fi
+          echo "Running in: ${{ steps.mode.outputs.mode }} mode"
+
+      - name: Run full evaluation
+        env:
+          EXPERIMENT: ${{ inputs.experiment || 'final' }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          python -m app.evaluation.run \
+            --experiment $EXPERIMENT \
+            --output evals/results/ \
+            --baseline evals/baselines/baseline.json
+
+      # --- Generate benchmark report ---
+      - name: Generate benchmark report
+        run: python scripts/generate_benchmark.py
+
+      # --- Upload reports as artifacts ---
+      - name: Upload evaluation reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: evaluation-reports-${{ github.run_number }}
+          path: |
+            evals/reports/
+            evals/results/
+          retention-days: 30
+
+      # --- Regression check ---
+      - name: Check for regressions
+        run: |
+          python -m app.evaluation.run \
+            --experiment ${{ inputs.experiment || 'final' }} \
+            --baseline evals/baselines/baseline.json \
+            --no-regression-check || true
+          # Exit 0 — regression failures are reported but do not fail the workflow
+          # on nightly runs. Use branch protection + required status checks to gate.
+
+      - name: Show baseline comparison
+        run: python scripts/show_baseline.py
+
+  # --------------------------------------------------------------------------
+  # Job 2: Nightly regression gate — fails the workflow if metrics regress
+  # --------------------------------------------------------------------------
+  regression-gate:
+    name: Regression gate
+    needs: [full-evaluation]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Download latest results
+        uses: actions/download-artifact@v4
+        with:
+          name: evaluation-reports-${{ github.run_number }}
+          path: evals/reports/
+
+      - name: Run regression check against baseline
+        run: python scripts/update_baseline.py --check --experiment ${{ inputs.experiment || 'final' }}

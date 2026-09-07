@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Untitled</title>
+</head>
+<body>
+<p>---</p>
+<p>doc_id: database-behavior</p>
+<p>title: Database Behavior</p>
+<p>version: 1.0</p>
+<p>module: database</p>
+<p>last_updated: 2026-09-06</p>
+<p>---</p>
+<br>
+<br>
+<h2>Database Behavior (#database-behavior)</h2>
+<br>
+<p>The platform stores metadata in PostgreSQL 16. The connection pool has a maximum of 100 connections per instance.</p>
+<br>
+<p>The database stores documents, chunks, ingestion jobs, queries, and evaluation runs. Vector embeddings are stored in Qdrant, not in PostgreSQL.</p>
+<br>
+<p>Backups are taken every 12 hours and retained for 30 days.</p>
+</body>
+</html>

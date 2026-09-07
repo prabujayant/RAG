@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Untitled</title>
+</head>
+<body>
+<p>---</p>
+<p>doc_id: sso-saml</p>
+<p>title: SAML 2.0 Enterprise SSO</p>
+<p>version: 1.0</p>
+<p>module: oauth</p>
+<p>last_updated: 2026-09-06</p>
+<p>---</p>
+<br>
+<br>
+<h2>SSO and Federation (#sso-and-federation)</h2>
+<br>
+<p>Enterprise SSO is available on the Enterprise plan. AskMyDocs supports SAML 2.0 and OpenID Connect identity providers.</p>
+<br>
+<p>When SSO is enabled, password authentication is disabled for all users in that organization. SCIM is supported for automatic user provisioning and deprovisioning.</p>
+<br>
+<h2>Discovery (#discovery)</h2>
+<br>
+<p>OAuth configuration is published at the well-known endpoint:</p>
+<br>
+<pre><code>
+https://identity.askmydocs.example/.well-known/openid-configuration
+</pre>
+<br>
+<p>The discovery document lists authorization, token, revocation, and JWKS endpoints. Clients must fetch this document at startup and honor the expiration hints.</p>
+</body>
+</html>

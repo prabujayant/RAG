@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Untitled</title>
+</head>
+<body>
+<p>---</p>
+<p>doc_id: environments</p>
+<p>title: Environments</p>
+<p>version: 1.0</p>
+<p>module: deployment</p>
+<p>last_updated: 2026-09-06</p>
+<p>---</p>
+<br>
+<br>
+<h2>Environments (#environments)</h2>
+<br>
+<p>The platform supports three deployment environments.</p>
+<br>
+<table>
+<tr><td><b>Environment</b></td><td><b>Purpose</b></td><td><b>Data isolation</b></td></tr>
+<tr><td>development</td><td>Local iteration</td><td>Full isolation</td></tr>
+<tr><td>staging</td><td>Pre-production validation</td><td>Shared test data</td></tr>
+<tr><td>production</td><td>Live traffic</td><td>Full isolation</td></tr>
+</table>
+<br>
+<blockquote>Warning: Do not use production credentials in development or staging.</blockquote>
+<br>
+<h2>Database Migrations (#database-migrations)</h2>
+<br>
+<p>Schema changes are applied through versioned migrations. Migrations run automatically at deploy time before new code is released.</p>
+<br>
+<p>Downgrades are not supported automatically. Always back up before deploying a migration.</p>
+</body>
+</html>

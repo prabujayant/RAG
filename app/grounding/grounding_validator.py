@@ -1,0 +1,389 @@
+"""Aggregate grounding validation.
+
+Takes an AnswerResponse, extracts claims, validates citations,
+and produces a grounded response with status and confidence.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+from app.generation.schemas import (
+    AnswerClaim,
+    AnswerResponse,
+    Citation,
+    CitationStatus,
+    GroundingStatus,
+)
+from app.grounding.citation_validator import CitationValidator, ValidationResult
+from app.grounding.claims import Claim, ClaimExtractor
+
+if TYPE_CHECKING:
+    from app.generation.client import LLMClient
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# LLM Judge prompt
+# ---------------------------------------------------------------------------
+
+_LLM_JUDGE_SYSTEM = (
+    "You are a strict factual accuracy judge. "
+    "Given a CLAIM and cited EVIDENCE, respond with ONLY a JSON object "
+    "and nothing else:\n"
+    '{"status": "supported" | "partially_supported" | "unsupported", '
+    '"score": <float 0.0-1.0>, '
+    '"reason": "<brief explanation>"}\n'
+    "Be strict: invented or unreferenced facts must be marked unsupported."
+)
+
+_LLM_JUDGE_USER = (
+    "CLAIM: {claim}\n\n"
+    "EVIDENCE (source: {source}, section: {section}):\n"
+    "{evidence}"
+)
+
+
+def _build_llm_judge_messages(
+    claim: str,
+    evidence: str,
+    section: str | None,
+    source: str | None,
+) -> tuple[str, str]:
+    """Build (system_prompt, user_prompt) for the LLM judge."""
+    system_prompt = _LLM_JUDGE_SYSTEM
+    user_prompt = _LLM_JUDGE_USER.format(
+        claim=claim,
+        evidence=evidence,
+        section=section or "unknown",
+        source=source or "unknown document",
+    )
+    return system_prompt, user_prompt
+
+
+# ---------------------------------------------------------------------------
+# ValidationResult helpers
+# ---------------------------------------------------------------------------
+
+def _parse_llm_judge_response(raw: str) -> dict | None:
+    """Extract JSON from the LLM judge response."""
+    # Try fenced JSON first
+    fenced = re.search(r"```json\s*(\{.*?\})\s*```", raw, re.DOTALL)
+    if fenced:
+        try:
+            return json.loads(fenced.group(1))
+        except json.JSONDecodeError:
+            pass
+    # Try bare JSON object
+    bare = re.search(r"\{.*\}", raw, re.DOTALL)
+    if bare:
+        try:
+            return json.loads(bare.group(0))
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# GroundingValidator
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GroundingConfig:
+    """Configuration for the grounding validator.
+
+    Attributes
+    ----------
+    use_llm_judge:
+        Whether to use the LLM judge for validation. Default False (deterministic only).
+    supported_threshold:
+        Token overlap ratio for SUPPORTED. Default 0.65.
+    partial_threshold:
+        Token overlap ratio for PARTIALLY_SUPPORTED. Default 0.30.
+    confidence_scale_with_support:
+        If True, confidence is multiplied by average support score. Default True.
+    """
+
+    use_llm_judge: bool = False
+    supported_threshold: float = 0.65
+    partial_threshold: float = 0.30
+    confidence_scale_with_support: bool = True
+
+
+class GroundingValidator:
+    """Validates an AnswerResponse and produces a grounded result.
+
+    Parameters
+    ----------
+    config:
+        GroundingConfig controlling behavior. Default is deterministic-only.
+    citation_validator:
+        CitationValidator instance. If None, created with defaults.
+    claim_extractor:
+        ClaimExtractor instance. If None, created with defaults.
+    llm_client:
+        Optional LLMClient for LLM-assisted validation.
+    """
+
+    def __init__(
+        self,
+        config: GroundingConfig | None = None,
+        citation_validator: CitationValidator | None = None,
+        claim_extractor: ClaimExtractor | None = None,
+        llm_client: LLMClient | None = None,
+    ) -> None:
+        self.config = config or GroundingConfig()
+        self.citation_validator = citation_validator or CitationValidator(
+            supported_threshold=self.config.supported_threshold,
+            partial_threshold=self.config.partial_threshold,
+        )
+        self.claim_extractor = claim_extractor or ClaimExtractor()
+        self._llm_client = llm_client
+
+    def validate(self, response: AnswerResponse) -> AnswerResponse:
+        """Validate an AnswerResponse and return an updated copy.
+
+        This method:
+        1. Extracts claims from the answer text
+        2. Validates each citation against the evidence
+        3. Calculates grounding status and confidence
+        4. Returns a new AnswerResponse with updated fields
+        """
+        from app.generation.schemas import GroundingStatus
+
+        # If the answer was refused, propagate that
+        if response.refused:
+            return self._build_refused_response(response)
+
+        # Extract claims from answer text
+        raw_claims = self.claim_extractor.extract(response.answer)
+
+        # Build a map from citation_id -> Citation for lookup
+        citation_map: dict[str, Citation] = {c.citation_id: c for c in response.citations}
+
+        validated_claims: list[AnswerClaim] = []
+        for raw in raw_claims:
+            answer_claim = self._validate_claim(raw, citation_map, response.citations)
+            validated_claims.append(answer_claim)
+
+        # Calculate aggregate grounding status
+        grounding_status = self._compute_grounding_status(validated_claims, response.refused)
+
+        # Calculate grounding confidence
+        confidence = self._compute_confidence(
+            validated_claims,
+            response.confidence,
+            grounding_status,
+        )
+
+        grounded = grounding_status == GroundingStatus.GROUNDED
+
+        return AnswerResponse(
+            answer=response.answer,
+            citations=response.citations,
+            claims=validated_claims,
+            grounded=grounded,
+            grounding_status=grounding_status,
+            confidence=confidence,
+            refused=response.refused,
+            refused_reason=response.refused_reason,
+            total_latency_ms=response.total_latency_ms,
+            model=response.model,
+        )
+
+    def _validate_claim(
+        self,
+        raw: Claim,
+        citation_map: dict[str, Citation],
+        all_citations: list[Citation],
+    ) -> AnswerClaim:
+        """Validate a single claim against its cited evidence.
+
+        Returns an AnswerClaim with status and reason.
+        """
+        from app.generation.schemas import CitationStatus
+
+        # If no citations, mark as unsupported with no reason
+        if not raw.citation_ids:
+            return AnswerClaim(
+                claim=raw.text,
+                citation_ids=[],
+                status=CitationStatus.UNSUPPORTED,
+                reason="Claim has no citations.",
+            )
+
+        validated_statuses: list[CitationStatus] = []
+        reasons: list[str] = []
+
+        for cid in raw.citation_ids:
+            citation = citation_map.get(cid)
+            if citation is None:
+                # Unknown citation ID
+                validated_statuses.append(CitationStatus.UNSUPPORTED)
+                reasons.append(f"Unknown citation ID: {cid}.")
+                continue
+
+            evidence_text = citation.text
+            validation_result = self._do_validate(
+                raw.text, evidence_text, cid, citation.section, None,
+            )
+            validated_statuses.append(validation_result.status)
+            reasons.append(f"[{cid}] {validation_result.reason}")
+
+        # Aggregate: best status wins
+        overall_status = self._aggregate_statuses(validated_statuses)
+        # Combine reasons
+        combined_reason = " ".join(reasons) if reasons else None
+
+        return AnswerClaim(
+            claim=raw.text,
+            citation_ids=raw.citation_ids,
+            status=overall_status,
+            reason=combined_reason,
+        )
+
+    def _do_validate(
+        self,
+        claim: str,
+        evidence: str,
+        citation_id: str,
+        section: str | None,
+        source: str | None,
+    ) -> ValidationResult:
+        """Perform validation, using LLM judge if configured."""
+        # Fast deterministic path
+        result = self.citation_validator.validate(claim, evidence, citation_id)
+
+        # If already clearly supported/unsupported by deterministic check, use it
+        if self.config.use_llm_judge and result.status == CitationStatus.PARTIALLY_SUPPORTED:
+            # Only use LLM for ambiguous cases
+            llm_result = self._llm_judge(claim, evidence, citation_id, section, source)
+            if llm_result is not None:
+                raw_status = llm_result.get("status", "unsupported")
+                try:
+                    status = CitationStatus(raw_status)
+                except ValueError:
+                    status = CitationStatus.UNSUPPORTED
+                score = float(llm_result.get("score", 0.0))
+                reason = llm_result.get("reason", "LLM judge returned no reason.")
+                return ValidationResult(status=status, score=score, reason=reason)
+
+        return result
+
+    def _llm_judge(
+        self,
+        claim: str,
+        evidence: str,
+        citation_id: str,
+        section: str | None,
+        source: str | None,
+    ) -> dict | None:
+        """Call the LLM judge, returning parsed JSON or None on failure."""
+        if self._llm_client is None:
+            return None
+
+        system_prompt, user_prompt = _build_llm_judge_messages(
+            claim, evidence, section, source
+        )
+
+        try:
+            raw_response = self._llm_client.generate(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                evidence_context=evidence,
+                max_output_tokens=150,
+                temperature=0.0,
+            )
+            return _parse_llm_judge_response(raw_response.text)
+        except Exception:
+            # LLM judge failure → fall back to deterministic
+            return None
+
+    def _aggregate_statuses(self, statuses: list[CitationStatus]) -> CitationStatus:
+        """Return the best (highest-priority) status from a list."""
+        if not statuses:
+            return CitationStatus.UNSUPPORTED
+        if CitationStatus.SUPPORTED in statuses:
+            return CitationStatus.SUPPORTED
+        if CitationStatus.PARTIALLY_SUPPORTED in statuses:
+            return CitationStatus.PARTIALLY_SUPPORTED
+        return CitationStatus.UNSUPPORTED
+
+    def _compute_grounding_status(
+        self,
+        claims: list[AnswerClaim],
+        refused: bool,
+    ) -> GroundingStatus:
+        """Compute aggregate grounding status from validated claims."""
+        if refused or not claims:
+            return GroundingStatus.REFUSED
+
+        statuses = [c.status for c in claims]
+        if not statuses:
+            return GroundingStatus.UNGROUNDED
+
+        if all(s == CitationStatus.SUPPORTED for s in statuses):
+            return GroundingStatus.GROUNDED
+        if any(s == CitationStatus.SUPPORTED for s in statuses):
+            return GroundingStatus.PARTIALLY_GROUNDED
+        return GroundingStatus.UNGROUNDED
+
+    def _compute_confidence(
+        self,
+        claims: list[AnswerClaim],
+        llm_confidence: float | None,
+        grounding_status: GroundingStatus,
+    ) -> float | None:
+        """Compute grounding confidence.
+
+        confidence = base × claim_support_avg × citation_completeness
+        """
+        if grounding_status == GroundingStatus.REFUSED:
+            return 0.0
+
+        if not claims:
+            return llm_confidence
+
+        # Average claim support score from the validator
+        claim_scores = [
+            1.0 if c.status == CitationStatus.SUPPORTED
+            else 0.5 if c.status == CitationStatus.PARTIALLY_SUPPORTED
+            else 0.0
+            for c in claims
+        ]
+        avg_support = sum(claim_scores) / len(claim_scores)
+
+        # Citation completeness: fraction of claims that have at least one citation
+        cited = sum(1 for c in claims if c.citation_ids)
+        citation_completeness = cited / len(claims)
+
+        # Base confidence from LLM, defaulting to 0.5
+        base = llm_confidence if llm_confidence is not None else 0.5
+
+        if self.config.confidence_scale_with_support:
+            confidence = base * avg_support * citation_completeness
+        else:
+            confidence = base * avg_support
+
+        # Clamp to [0, 1]
+        return max(0.0, min(1.0, confidence))
+
+    def _build_refused_response(self, response: AnswerResponse) -> AnswerResponse:
+        """Build a grounded response for an already-refused answer."""
+        return AnswerResponse(
+            answer=response.answer,
+            citations=response.citations,
+            claims=[],
+            grounded=False,
+            grounding_status=GroundingStatus.REFUSED,
+            confidence=0.0,
+            refused=True,
+            refused_reason=response.refused_reason,
+            total_latency_ms=response.total_latency_ms,
+            model=response.model,
+        )

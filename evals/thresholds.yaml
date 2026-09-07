@@ -1,0 +1,64 @@
+# Quality thresholds for CI regression gates.
+# Each entry: metric name, absolute minimum, and relative tolerance (fraction).
+# A metric regresses if: current < minimum OR (drop > tolerance AND not an improvement).
+# Used by app/evaluation/regression.py:check_regression().
+
+# RAGAs evaluation metrics
+ragas:
+  answer_correctness:
+    minimum: 0.60
+    tolerance: 0.10   # 10% relative tolerance
+
+  answer_relevancy:
+    minimum: 0.65
+    tolerance: 0.10
+
+  context_precision:
+    minimum: 0.55
+    tolerance: 0.10
+
+  context_recall:
+    minimum: 0.55
+    tolerance: 0.10
+
+  faithfulness:
+    minimum: 0.60
+    tolerance: 0.10
+
+# Retrieval metrics
+retrieval:
+  hit_rate:
+    minimum: 0.70
+    tolerance: 0.05   # 5% tolerance — more stringent for retrieval
+
+  mrr:
+    minimum: 0.65
+    tolerance: 0.05
+
+  recall_at_k:
+    minimum: 0.75
+    tolerance: 0.05
+
+# Citation metrics
+citation:
+  citation_correctness:
+    minimum: 0.80
+    tolerance: 0.05   # Citations must be very reliable
+
+  citation_recall:
+    minimum: 0.70
+    tolerance: 0.10
+
+# Per-difficulty thresholds (same metric names, applied to easy/medium/hard splits)
+per_difficulty:
+  recall_at_k:
+    minimum: 0.60
+    tolerance: 0.10
+
+  hit_rate:
+    minimum: 0.65
+    tolerance: 0.10
+
+  citation_correctness:
+    minimum: 0.75
+    tolerance: 0.05

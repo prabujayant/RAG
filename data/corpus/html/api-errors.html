@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Untitled</title>
+</head>
+<body>
+<p>---</p>
+<p>doc_id: api-errors</p>
+<p>title: API Error Reference</p>
+<p>version: 1.0</p>
+<p>module: api</p>
+<p>last_updated: 2026-09-06</p>
+<p>---</p>
+<br>
+<br>
+<h2>Error Response Format (#error-response-format)</h2>
+<br>
+<p>All errors use a consistent JSON envelope:</p>
+<br>
+<pre><code>
+{
+  "error": {
+    "code": "rate_limit_exceeded",
+    "message": "Rate limit exceeded. Retry after 5 seconds.",
+    "request_id": "req_9f1c",
+    "details": {}
+  }
+}
+</pre>
+<br>
+<p>The code field is a stable machine-readable string. The message is human-readable and may change.</p>
+<br>
+<h2>Error Codes (#error-codes)</h2>
+<br>
+<table>
+<tr><td><b>HTTP</b></td><td><b>Code</b></td><td><b>Common cause</b></td></tr>
+<tr><td>400</td><td>invalid_request</td><td>Malformed request body</td></tr>
+<tr><td>401</td><td>unauthenticated</td><td>Missing or invalid token</td></tr>
+<tr><td>403</td><td>permission_denied</td><td>Token lacks required scope</td></tr>
+<tr><td>404</td><td>not_found</td><td>Resource does not exist</td></tr>
+<tr><td>409</td><td>conflict</td><td>Resource already exists or state conflict</td></tr>
+<tr><td>422</td><td>validation_failed</td><td>Request body failed validation</td></tr>
+<tr><td>429</td><td>rate_limit_exceeded</td><td>Too many requests</td></tr>
+<tr><td>5xx</td><td>internal_error</td><td>Server-side failure</td></tr>
+</table>
+<br>
+<p>Retryable errors are those in the 5xx range, 429, and 408. Client code should only retry those statuses, with exponential backoff and jitter.</p>
+<br>
+<h2>Troubleshooting Common Errors (#troubleshooting-common-errors)</h2>
+<br>
+<p>401 unauthenticated: verify the token is not expired and is sent in the Authorization header.</p>
+<br>
+<p>403 permission_denied: the token lacks the required scope. Request the scope in the OAuth consent screen.</p>
+<br>
+<p>429 rate_limit_exceeded: inspect the Retry-After header and back off.</p>
+<br>
+<p>5xx internal_error: check the status page; retry with exponential backoff.</p>
+</body>
+</html>

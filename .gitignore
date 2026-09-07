@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+*.ipynb_checkpoints
+
+# Secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Evaluation / experiment outputs (generated, not committed)
+evals/reports/
+evals/results/
+evals/baselines/
+models/
+
+# ML model caches (downloaded by sentence-transformers / ragas datasets)
+models/
+.ragas_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Langfuse / local trace caches
+.langfuse_cache/
