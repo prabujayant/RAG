@@ -82,10 +82,11 @@ class OpenRouterClient(LLMClient):
         http_client: httpx.Client | None = None,
     ) -> None:
         self._settings = settings or get_settings()
-        self._http_client = http_client
+        # Reuse a shared HTTP client to pool connections across calls.
+        self._http_client: httpx.Client = http_client or self._build_client()
 
-    def _build_retry_client(self) -> httpx.Client:
-        """Build an HTTP client with retry configuration."""
+    def _build_client(self) -> httpx.Client:
+        """Build a keep-alive HTTP client with connection pooling."""
         return httpx.Client(
             base_url=self._settings.openrouter_base_url,
             headers={
@@ -93,19 +94,14 @@ class OpenRouterClient(LLMClient):
                 "Content-Type": "application/json",
             },
             timeout=httpx.Timeout(self._settings.llm_timeout_seconds),
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=5),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
         )
 
     def _make_request(self, payload: dict) -> httpx.Response:
-        """Make an HTTP request to the OpenRouter API with retries."""
-        client = self._http_client or self._build_retry_client()
-        try:
-            response = client.post("/chat/completions", json=payload)
-            response.raise_for_status()
-            return response
-        finally:
-            if self._http_client is None:
-                client.close()
+        """Make an HTTP request to the OpenRouter API."""
+        response = self._http_client.post("/chat/completions", json=payload)
+        response.raise_for_status()
+        return response
 
     def generate(
         self,

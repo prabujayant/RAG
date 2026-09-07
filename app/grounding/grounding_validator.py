@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -166,10 +167,24 @@ class GroundingValidator:
         # Build a map from citation_id -> Citation for lookup
         citation_map: dict[str, Citation] = {c.citation_id: c for c in response.citations}
 
+        # Validate all cited claims in parallel so LLM judge calls are concurrent.
+        # Each call is I/O-bound (HTTP request to the LLM API), so ThreadPoolExecutor
+        # gives near-linear speedup on multi-core machines.
         validated_claims: list[AnswerClaim] = []
-        for raw in raw_claims:
-            answer_claim = self._validate_claim(raw, citation_map, response.citations)
-            validated_claims.append(answer_claim)
+        if raw_claims:
+            with ThreadPoolExecutor(max_workers=min(len(raw_claims), 8)) as pool:
+                futures = {
+                    pool.submit(
+                        self._validate_claim, raw, citation_map, response.citations
+                    ): idx
+                    for idx, raw in enumerate(raw_claims)
+                }
+                # Collect results in submission order to preserve claim sequence
+                results: list[AnswerClaim | None] = [None] * len(raw_claims)
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    results[idx] = future.result()
+                validated_claims = [r for r in results if r is not None]
 
         # Calculate aggregate grounding status
         grounding_status = self._compute_grounding_status(validated_claims, response.refused)

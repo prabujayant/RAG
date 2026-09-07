@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 from app.config import get_settings
@@ -26,6 +27,25 @@ logger = logging.getLogger(__name__)
 # BGE-M3 returns 1024-d vectors; keep an explicit constant so tests can
 # detect dimension drift before the real model is loaded.
 BGE_M3_DIM = 1024
+
+
+# ---------------------------------------------------------------------------
+# Module-level model singleton (loaded once, shared across all Embedder
+# instances).  Using an lru_cache here means every Embedder instance — even
+# ones created per-request in route handlers — will reuse the same
+# SentenceTransformer object without repeatedly loading it from disk.
+# ---------------------------------------------------------------------------
+
+
+@lru_cache(maxsize=1)
+def _get_shared_model(model_name: str) -> "SentenceTransformer":
+    """Load and cache the sentence-transformer model at module scope."""
+    logger.info("Loading embedding model %s …", model_name)
+    from sentence_transformers import SentenceTransformer
+
+    model = SentenceTransformer(model_name)
+    logger.info("Embedding model %s loaded", model_name)
+    return model
 
 
 class Embedder:
@@ -51,19 +71,11 @@ class Embedder:
         self.batch_size = s.embedding_batch_size
         self.vector_size = s.embedding_dim
         self._vector_store = vector_store
-        self._model: SentenceTransformer | None = None  # lazy load
 
     @property
-    def model(self) -> SentenceTransformer:
-        """Lazily load and cache the sentence-transformer model."""
-        if self._model is None:
-            logger.info("Loading embedding model %s …", self.model_name)
-            from sentence_transformers import SentenceTransformer
-
-            self._model = SentenceTransformer(self.model_name)
-            logger.info("Embedding model %s loaded", self.model_name)
-        assert self._model is not None
-        return self._model
+    def model(self) -> "SentenceTransformer":
+        """Return the shared sentence-transformer model (loaded once)."""
+        return _get_shared_model(self.model_name)
 
     def _check_dim(self, vectors: list[list[float]]) -> None:
         """Fail fast when the model output disagrees with configured EMBEDDING_DIM."""
