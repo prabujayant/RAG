@@ -103,7 +103,7 @@ async def query(
 
     # Step 3: claim extraction + grounding validation (Phase 7)
     try:
-        validator = GroundingValidator()
+        validator = GroundingValidator(llm_client=generation_service.client)
         validated: AnswerResponse = validator.validate(response)
     except Exception as exc:
         logger.warning(

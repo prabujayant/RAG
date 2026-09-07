@@ -49,10 +49,15 @@ def _bm25_hit_to_result(hit: dict, rank: int) -> RetrievalResult:
 
 
 def _vector_hit_to_result(hit: dict, rank: int) -> RetrievalResult:
-    """Convert a Qdrant vector search hit dict to a RetrievalResult."""
+    """Convert a Qdrant vector search hit dict to a RetrievalResult.
+
+    The Qdrant point id is a UUID derived from the chunk id (real Qdrant
+    rejects string point ids), so the authoritative ``chunk_id`` lives in the
+    point payload.
+    """
     payload = hit["payload"]
     return RetrievalResult(
-        chunk_id=str(hit["id"]),
+        chunk_id=payload.get("chunk_id") or str(hit["id"]),
         document_id=payload["document_id"],
         text=payload["text"],
         score=hit["score"],

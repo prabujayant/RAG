@@ -109,9 +109,9 @@ class GroundingConfig:
         If True, confidence is multiplied by average support score. Default True.
     """
 
-    use_llm_judge: bool = False
-    supported_threshold: float = 0.65
-    partial_threshold: float = 0.30
+    use_llm_judge: bool = True
+    supported_threshold: float = 0.55
+    partial_threshold: float = 0.20
     confidence_scale_with_support: bool = True
 
 
@@ -255,13 +255,21 @@ class GroundingValidator:
         section: str | None,
         source: str | None,
     ) -> ValidationResult:
-        """Perform validation, using LLM judge if configured."""
-        # Fast deterministic path
+        """Perform validation, using the LLM judge as the semantic arbiter.
+
+        This mirrors OpenAI-style groundedness checks: rather than relying on
+        brittle token-overlap heuristics, the judge reads the claim together
+        with the cited evidence and decides whether the claim is supported.
+        The deterministic validator remains as a fast fallback if the LLM
+        judge is unavailable or fails.
+        """
+        # Fast deterministic path (used as a fallback / sanity baseline)
         result = self.citation_validator.validate(claim, evidence, citation_id)
 
-        # If already clearly supported/unsupported by deterministic check, use it
-        if self.config.use_llm_judge and result.status == CitationStatus.PARTIALLY_SUPPORTED:
-            # Only use LLM for ambiguous cases
+        # When the LLM judge is enabled, its semantic verdict is authoritative.
+        # This rescues answers the model paraphrases rather than copying verbatim,
+        # which deterministic token-overlap would otherwise (incorrectly) flag.
+        if self.config.use_llm_judge:
             llm_result = self._llm_judge(claim, evidence, citation_id, section, source)
             if llm_result is not None:
                 raw_status = llm_result.get("status", "unsupported")
@@ -269,7 +277,10 @@ class GroundingValidator:
                     status = CitationStatus(raw_status)
                 except ValueError:
                     status = CitationStatus.UNSUPPORTED
-                score = float(llm_result.get("score", 0.0))
+                try:
+                    score = float(llm_result.get("score", 0.0))
+                except (TypeError, ValueError):
+                    score = 0.0
                 reason = llm_result.get("reason", "LLM judge returned no reason.")
                 return ValidationResult(status=status, score=score, reason=reason)
 

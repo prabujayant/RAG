@@ -12,6 +12,7 @@ Production-ready vector search on top of Qdrant. Supports:
 from __future__ import annotations
 
 import logging
+import uuid
 from collections.abc import Iterable
 
 from qdrant_client import QdrantClient
@@ -24,6 +25,17 @@ from app.config.settings import Settings
 from app.ingestion.chunker import Chunk
 
 logger = logging.getLogger(__name__)
+
+
+def _point_id(chunk_id: str) -> str:
+    """Deterministic Qdrant point id (UUID) derived from a chunk_id.
+
+    Qdrant only accepts unsigned-integer or UUID point ids, but our chunk ids
+    are strings of the form ``{document_id}:{index}``. We derive a stable UUID
+    from the chunk id so re-indexing a chunk is idempotent and the mapping is
+    fully deterministic. The original ``chunk_id`` is retained in the payload.
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, chunk_id))
 
 
 def _point_payload(chunk: Chunk) -> dict:
@@ -125,7 +137,7 @@ class VectorStore:
                 )
             points.append(
                 qm.PointStruct(
-                    id=chunk.chunk_id,
+                    id=_point_id(chunk.chunk_id),
                     vector=vector,
                     payload=_point_payload(chunk),
                 )
@@ -140,7 +152,7 @@ class VectorStore:
         """Return a single point's payload, or None if missing."""
         try:
             resp = self._client.retrieve(
-                collection_name=self.collection, ids=[chunk_id], with_payload=True
+                collection_name=self.collection, ids=[_point_id(chunk_id)], with_payload=True
             )
         except UnexpectedResponse:
             return None
@@ -208,7 +220,8 @@ class VectorStore:
         ids = list(chunk_ids)
         if not ids:
             return 0
-        self._client.delete(collection_name=self.collection, points_selector=ids, wait=True)  # type: ignore[arg-type]
+        point_ids = [_point_id(cid) for cid in ids]
+        self._client.delete(collection_name=self.collection, points_selector=point_ids, wait=True)  # type: ignore[arg-type]
         return len(ids)
 
     def delete_by_document(self, document_id: str) -> int:

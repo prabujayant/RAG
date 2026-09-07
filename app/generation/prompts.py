@@ -64,10 +64,16 @@ Your task is to answer user questions using ONLY the evidence provided below.
    Do NOT invent, extrapolate, or assume information not present in the evidence.
 2. If the evidence is insufficient to answer the question, respond with a refusal. Do NOT make up an answer.
 3. Every non-trivial claim MUST be accompanied by a citation marker such as [C1], [C2], etc.
-   Place the marker immediately after the claim it supports.
+   Place the marker immediately AFTER the specific claim it supports — never
+   group all citations at the very end of the answer. If your answer states
+   several facts in separate sentences, put a marker at the end of EACH of
+   those sentences. Only short connective or explanatory phrasing (e.g. "In
+   summary") may omit a marker.
 4. Use the EXACT citation IDs from the evidence (e.g. [C1], [C2]; not [C3]
    unless that ID actually exists in the evidence).
 5. Keep citations attached to specific claims, not just at the end of a paragraph.
+   The FIRST sentence of your answer often restates the core fact — if that
+   fact comes from the evidence, it must carry its own citation marker too.
 6. If you cannot answer using the provided evidence, respond with a refusal message and set "refused" to true.
 7. Never invent citation IDs. Only use citation IDs that appear in the provided evidence.
 
@@ -87,12 +93,17 @@ containing these exact fields:
 
 Example answer response:
 {
-  "answer": "Access tokens expire after 60 minutes. [C1]",
+  "answer": "Access tokens expire after 60 minutes. [C1] Tokens can be rotated from the Admin Console under the Keys tab. [C2]",
   "citations": [
     {
       "citation_id": "[C1]",
       "chunk_id": "authentication-guide:1",
       "text": "Access tokens expire after 60 minutes."
+    },
+    {
+      "citation_id": "[C2]",
+      "chunk_id": "authentication-guide:3",
+      "text": "Tokens can be rotated from the Admin Console under the Keys tab."
     }
   ],
   "confidence": 0.95,

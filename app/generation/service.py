@@ -87,6 +87,33 @@ def _build_citation_id_set(candidates: list[RetrievalResult]) -> set[str]:
     return {f"[C{i}]" for i in range(1, len(candidates) + 1)}
 
 
+def _citation_index(citation_id: str) -> int | None:
+    """Return the 0-based candidate index for a citation_id like ``[C1]``.
+
+    Returns ``None`` if the ID cannot be parsed or is out of range (checked
+    by the caller against the candidate length).
+    """
+    stripped = citation_id.strip("[]C")
+    try:
+        idx = int(stripped) - 1
+    except ValueError:
+        return None
+    if idx < 0:
+        return None
+    return idx
+
+
+def _candidate_for_citation_id(
+    citation_id: str,
+    candidates: list[RetrievalResult],
+) -> RetrievalResult | None:
+    """Map a citation_id like ``[C1]`` to its corresponding candidate chunk."""
+    idx = _citation_index(citation_id)
+    if idx is None or idx >= len(candidates):
+        return None
+    return candidates[idx]
+
+
 def _find_chunk_id_for_citation(
     citation_id: str, candidates: list[RetrievalResult]
 ) -> str | None:
@@ -239,19 +266,25 @@ class GenerationService:
         valid_chunk_ids: set[str],
         valid_citation_ids: set[str],
     ) -> list[Citation]:
-        """Parse citation objects, dropping those with unknown IDs."""
+        """Parse citation objects, dropping those with unknown IDs.
+
+        Citation markers like ``[C1]`` map 1:1 to the retrieved candidate list
+        (``[C{i}]`` ↔ ``candidates[i - 1]``). Evidence text and chunk metadata
+        are therefore resolved authoritatively from the *candidate* that was
+        shown to the model, rather than trusting the model to echo back the
+        ``chunk_id`` and ``text`` byte-for-byte. This makes grounding robust to
+        models that truncate, rephrase, or omit the text/chunk fields.
+        """
         raw_citations: list[dict] = data.get("citations") or []
         citations: list[Citation] = []
 
         for c in raw_citations:
             try:
                 citation_id = _normalize_citation_id(c.get("citation_id", ""))
-                chunk_id = str(c.get("chunk_id", ""))
-                text = str(c.get("text", ""))
             except (TypeError, ValueError):
                 continue  # skip malformed entries
 
-            # Reject unknown citation IDs
+            # Reject unknown citation IDs (e.g. [C99] when only 5 chunks shown)
             if citation_id not in valid_citation_ids:
                 logger.debug(
                     "Dropping citation with unknown ID %r (valid: %s)",
@@ -260,22 +293,18 @@ class GenerationService:
                 )
                 continue
 
-            # Reject unknown chunk IDs
-            if chunk_id not in valid_chunk_ids:
-                logger.debug(
-                    "Dropping citation %r: unknown chunk_id %r",
-                    citation_id,
-                    chunk_id,
-                )
+            # Map [C{i}] -> candidates[i - 1] to get the authoritative chunk.
+            candidate = _candidate_for_citation_id(citation_id, candidates)
+            if candidate is None:
                 continue
 
             citations.append(
                 Citation(
                     citation_id=citation_id,
-                    chunk_id=chunk_id,
-                    text=text,
-                    page_number=c.get("page_number"),
-                    section=c.get("section"),
+                    chunk_id=candidate.chunk_id,
+                    text=candidate.text,
+                    page_number=candidate.page_number,
+                    section=candidate.section,
                 )
             )
 

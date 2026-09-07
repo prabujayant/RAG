@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AskMyDocs</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f1117;
+      --surface: #1a1d27;
+      --surface2: #21253a;
+      --border: #2e3350;
+      --accent: #6c63ff;
+      --accent2: #9b84ff;
+      --text: #e4e6f1;
+      --muted: #8b90a8;
+      --green: #4caf82;
+      --red: #f05a7e;
+      --yellow: #f0b95a;
+    }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Header ── */
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 14px 32px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    header .logo {
+      width: 32px;
+      height: 32px;
+      background: var(--accent);
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 900;
+      font-size: 16px;
+      color: #fff;
+      flex-shrink: 0;
+    }
+
+    header h1 { font-size: 18px; font-weight: 700; letter-spacing: -0.3px; }
+    header h1 span { color: var(--accent2); }
+
+    header .api-status {
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .status-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--muted);
+    }
+    .status-dot.ok { background: var(--green); box-shadow: 0 0 6px var(--green); }
+    .status-dot.bad { background: var(--red); }
+
+    /* ── Main layout ── */
+    main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      max-width: 860px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 48px 24px;
+    }
+
+    /* ── Query input ── */
+    .query-section { margin-bottom: 32px; }
+
+    .query-label {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 10px;
+    }
+
+    .input-row {
+      display: flex;
+      gap: 10px;
+      align-items: stretch;
+    }
+
+    #question {
+      flex: 1;
+      background: var(--surface);
+      border: 1.5px solid var(--border);
+      border-radius: 12px;
+      color: var(--text);
+      font-size: 15px;
+      padding: 14px 18px;
+      resize: none;
+      outline: none;
+      transition: border-color 0.2s;
+      min-height: 54px;
+      max-height: 160px;
+      font-family: inherit;
+    }
+
+    #question:focus { border-color: var(--accent); }
+    #question::placeholder { color: var(--muted); }
+
+    #askBtn {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 12px;
+      padding: 14px 24px;
+      font-size: 15px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: background 0.2s, transform 0.1s;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    #askBtn:hover:not(:disabled) { background: var(--accent2); }
+    #askBtn:active:not(:disabled) { transform: scale(0.97); }
+    #askBtn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    /* ── Loading spinner ── */
+    .spinner {
+      display: none;
+      width: 18px; height: 18px;
+      border: 2.5px solid rgba(255,255,255,0.3);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      margin: 0 auto;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Error banner ── */
+    .error-banner {
+      display: none;
+      background: rgba(240,90,126,0.12);
+      border: 1px solid rgba(240,90,126,0.3);
+      border-radius: 10px;
+      padding: 12px 16px;
+      margin-top: 10px;
+      font-size: 14px;
+      color: var(--red);
+    }
+
+    /* ── Answer section ── */
+    .answer-section { display: none; }
+
+    .answer-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      overflow: hidden;
+      margin-bottom: 24px;
+    }
+
+    .answer-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 3px 10px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+    .badge.green { background: rgba(76,175,130,0.15); color: var(--green); }
+    .badge.red { background: rgba(240,90,126,0.15); color: var(--red); }
+    .badge.yellow { background: rgba(240,185,90,0.15); color: var(--yellow); }
+
+    .answer-body {
+      padding: 22px 24px;
+      font-size: 16px;
+      line-height: 1.7;
+      color: var(--text);
+    }
+
+    .confidence-row {
+      padding: 12px 24px 18px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .conf-bar-bg {
+      flex: 1;
+      height: 4px;
+      background: var(--surface2);
+      border-radius: 2px;
+      overflow: hidden;
+      max-width: 120px;
+    }
+    .conf-bar { height: 100%; background: var(--accent); border-radius: 2px; transition: width 0.4s ease; }
+
+    /* ── Claims ── */
+    .claims-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      cursor: pointer;
+      user-select: none;
+    }
+    .claims-header::before { content: '▸'; transition: transform 0.2s; }
+    .claims-header.open::before { content: '▾'; }
+    .claims-body { display: none; padding: 12px 20px 16px; }
+    .claims-body.open { display: block; }
+
+    .claim-item {
+      background: var(--surface2);
+      border-radius: 8px;
+      padding: 10px 14px;
+      margin-bottom: 8px;
+      font-size: 14px;
+      line-height: 1.5;
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+    }
+    .claim-item:last-child { margin-bottom: 0; }
+
+    .claim-icon { flex-shrink: 0; margin-top: 1px; }
+    .claim-icon.ok { color: var(--green); }
+    .claim-icon.fail { color: var(--red); }
+    .claim-icon.warn { color: var(--yellow); }
+    .claim-text { color: var(--text); }
+
+    /* ── Citations ── */
+    .citations-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    .citation-item {
+      display: flex;
+      gap: 12px;
+      padding: 12px 20px;
+      border-bottom: 1px solid var(--border);
+      align-items: flex-start;
+    }
+    .citation-item:last-child { border-bottom: none; }
+
+    .citation-num {
+      background: var(--accent);
+      color: #fff;
+      font-size: 11px;
+      font-weight: 800;
+      padding: 2px 7px;
+      border-radius: 4px;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+
+    .citation-body { flex: 1; }
+    .citation-source {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .citation-text { font-size: 13px; color: var(--text); line-height: 1.55; }
+
+    /* ── History ── */
+    .history-section { margin-top: 48px; }
+    .history-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 12px;
+    }
+
+    .history-item {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 16px;
+      margin-bottom: 8px;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+    }
+    .history-item:hover { border-color: var(--accent); background: var(--surface2); }
+    .history-q { font-size: 13px; font-weight: 600; color: var(--text); margin-bottom: 4px; }
+    .history-a { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    /* ── Responsive ── */
+    @media (max-width: 600px) {
+      main { padding: 24px 16px; }
+      header { padding: 12px 16px; }
+      .input-row { flex-direction: column; }
+      #askBtn { width: 100%; padding: 14px; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo">Q</div>
+  <h1>Ask<span>MyDocs</span></h1>
+  <div class="api-status">
+    <div class="status-dot" id="statusDot"></div>
+    <span id="statusText">Checking API…</span>
+  </div>
+</header>
+
+<main>
+  <!-- Query Input -->
+  <div class="query-section">
+    <div class="query-label">Ask a question</div>
+    <div class="input-row">
+      <textarea
+        id="question"
+        rows="1"
+        placeholder="e.g. How do I rotate API keys?"
+        onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();submitQuery()}"
+        oninput="autoGrow(this)"
+      ></textarea>
+      <button id="askBtn" onclick="submitQuery()">
+        <span id="btnText">Ask</span>
+        <div class="spinner" id="spinner"></div>
+      </button>
+    </div>
+    <div class="error-banner" id="errorBanner"></div>
+  </div>
+
+  <!-- Answer -->
+  <div class="answer-section" id="answerSection">
+    <!-- Answer card -->
+    <div class="answer-card">
+      <div class="answer-header">
+        <span>Generated Answer</span>
+        <span class="badge" id="groundedBadge"></span>
+        <span class="badge" id="confidenceBadge"></span>
+      </div>
+      <div class="answer-body" id="answerBody"></div>
+      <div class="confidence-row" id="confRow">
+        <span>Confidence</span>
+        <div class="conf-bar-bg"><div class="conf-bar" id="confBar"></div></div>
+        <span id="confVal"></span>
+      </div>
+    </div>
+
+    <!-- Claims -->
+    <div class="answer-card" id="claimsCard">
+      <div class="claims-header" id="claimsToggle" onclick="toggleSection('claims')">
+        Claims &amp; Grounding
+        <span id="claimsCount" style="margin-left:4px;font-size:12px;font-weight:400"></span>
+      </div>
+      <div class="claims-body" id="claimsBody"></div>
+    </div>
+
+    <!-- Citations -->
+    <div class="answer-card" id="citationsCard">
+      <div class="citations-header">
+        Citations
+        <span id="citationsCount" style="margin-left:4px;font-size:12px;font-weight:400"></span>
+      </div>
+      <div id="citationsBody"></div>
+    </div>
+  </div>
+
+  <!-- History -->
+  <div class="history-section" id="historySection" style="display:none">
+    <div class="history-title">Recent Questions</div>
+    <div id="historyList"></div>
+  </div>
+</main>
+
+<script>
+  const API = 'http://127.0.0.1:8000';
+  let history = [];
+  let isLoading = false;
+
+  // ── Init ──
+  checkHealth();
+
+  async function checkHealth() {
+    const dot = document.getElementById('statusDot');
+    const txt = document.getElementById('statusText');
+    try {
+      const r = await fetch(`${API}/health`);
+      if (r.ok) {
+        const d = await r.json();
+        dot.className = 'status-dot ok';
+        txt.textContent = `v${d.version} · healthy`;
+      } else { throw 1; }
+    } catch {
+      dot.className = 'status-dot bad';
+      txt.textContent = 'API unreachable';
+    }
+  }
+
+  // ── Submit query ──
+  async function submitQuery() {
+    const q = document.getElementById('question').value.trim();
+    if (!q || isLoading) return;
+    setLoading(true);
+    hideError();
+    try {
+      const res = await fetch(`${API}/query`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question: q, top_k: 5 }),
+      });
+      if (!res.ok) {
+        const e = await res.json().catch(()=>({}));
+        throw new Error(e.detail?.message || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      renderAnswer(q, data);
+    } catch (err) {
+      showError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // ── Render ──
+  function renderAnswer(question, data) {
+    document.getElementById('answerSection').style.display = 'block';
+
+    // Answer text
+    document.getElementById('answerBody').textContent = data.answer || 'No answer returned.';
+
+    // Grounded badge
+    const gBadge = document.getElementById('groundedBadge');
+    if (data.grounded !== undefined && data.grounded !== null) {
+      if (data.grounded) {
+        gBadge.className = 'badge green';
+        gBadge.textContent = '✓ Grounded';
+      } else {
+        gBadge.className = 'badge red';
+        gBadge.textContent = '✗ Ungrounded';
+      }
+    } else {
+      gBadge.style.display = 'none';
+    }
+
+    // Confidence
+    const conf = parseFloat(data.confidence) || 0;
+    const cBadge = document.getElementById('confidenceBadge');
+    const confBar = document.getElementById('confBar');
+    const confVal = document.getElementById('confVal');
+    if (conf > 0) {
+      confBar.style.width = (conf * 100) + '%';
+      confVal.textContent = (conf * 100).toFixed(0) + '%';
+      cBadge.className = 'badge ' + (conf >= 0.7 ? 'green' : conf >= 0.4 ? 'yellow' : 'red');
+      cBadge.textContent = conf >= 0.7 ? 'High confidence' : conf >= 0.4 ? 'Medium confidence' : 'Low confidence';
+    } else {
+      document.getElementById('confRow').style.display = 'none';
+      cBadge.style.display = 'none';
+    }
+
+    // Claims
+    renderClaims(data.claims || []);
+
+    // Citations
+    renderCitations(data.citations || []);
+
+    // Add to history
+    addHistory(question, data.answer);
+
+    // Scroll to answer
+    document.getElementById('answerSection').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  function renderClaims(claims) {
+    const card = document.getElementById('claimsCard');
+    const body = document.getElementById('claimsBody');
+    const toggle = document.getElementById('claimsToggle');
+    const count = document.getElementById('claimsCount');
+
+    if (!claims.length) {
+      card.style.display = 'none';
+      return;
+    }
+    card.style.display = 'block';
+    count.textContent = `(${claims.length})`;
+
+    body.innerHTML = claims.map(c => {
+      const icon = c.status === 'grounded' ? '✓' : c.status === 'not_grounded' ? '✗' : '?';
+      const cls  = c.status === 'grounded' ? 'ok' : c.status === 'not_grounded' ? 'fail' : 'warn';
+      return `<div class="claim-item">
+        <div class="claim-icon ${cls}">${icon}</div>
+        <div class="claim-text">${escHtml(c.claim || c.text || '')}</div>
+      </div>`;
+    }).join('');
+  }
+
+  function renderCitations(citations) {
+    const card = document.getElementById('citationsCard');
+    const body = document.getElementById('citationsBody');
+    const count = document.getElementById('citationsCount');
+
+    if (!citations.length) {
+      card.style.display = 'none';
+      return;
+    }
+    card.style.display = 'block';
+    count.textContent = `(${citations.length})`;
+
+    body.innerHTML = citations.map((c, i) => {
+      const source = c.source || (c.page_number ? `p.${c.page_number}` : 'Source');
+      const text = c.text || c.content || '';
+      return `<div class="citation-item">
+        <div class="citation-num">[${i+1}]</div>
+        <div class="citation-body">
+          <div class="citation-source">${escHtml(source)}</div>
+          <div class="citation-text">${escHtml(text)}</div>
+        </div>
+      </div>`;
+    }).join('');
+  }
+
+  // ── History ──
+  function addHistory(question, answer) {
+    history.unshift({ question, answer, ts: Date.now() });
+    if (history.length > 10) history.pop();
+    renderHistory();
+  }
+
+  function renderHistory() {
+    const section = document.getElementById('historySection');
+    const list   = document.getElementById('historyList');
+    if (!history.length) { section.style.display = 'none'; return; }
+    section.style.display = 'block';
+    list.innerHTML = history.map((h, i) => `
+      <div class="history-item" onclick="loadHistory(${i})">
+        <div class="history-q">${escHtml(h.question)}</div>
+        <div class="history-a">${escHtml(h.answer)}</div>
+      </div>`).join('');
+  }
+
+  function loadHistory(i) {
+    const h = history[i];
+    document.getElementById('question').value = h.question;
+    submitQuery();
+  }
+
+  // ── UI helpers ──
+  function setLoading(v) {
+    isLoading = v;
+    document.getElementById('askBtn').disabled = v;
+    document.getElementById('btnText').style.display = v ? 'none' : 'inline';
+    document.getElementById('spinner').style.display = v ? 'block' : 'none';
+  }
+
+  function showError(msg) {
+    const el = document.getElementById('errorBanner');
+    el.textContent = msg;
+    el.style.display = 'block';
+  }
+  function hideError() {
+    document.getElementById('errorBanner').style.display = 'none';
+  }
+
+  function toggleSection(id) {
+    const el = document.getElementById(id + 'Body');
+    const tg = document.getElementById(id + 'Toggle');
+    el.classList.toggle('open');
+    tg.classList.toggle('open');
+  }
+
+  function autoGrow(el) {
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 160) + 'px';
+  }
+
+  function escHtml(s) {
+    return String(s)
+      .replace(/&/g,'&amp;')
+      .replace(/</g,'&lt;')
+      .replace(/>/g,'&gt;')
+      .replace(/"/g,'&quot;');
+  }
+</script>
+</body>
+</html>

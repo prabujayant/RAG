@@ -12,7 +12,9 @@ from dataclasses import dataclass, field
 
 import pytest
 from app.ingestion.chunker import Chunk, content_hash
-from app.retrieval.vector import VectorStore
+from app.retrieval.vector import VectorStore, _point_id
+
+POINT = _point_id  # Qdrant point id derived from a chunk_id
 
 # ---------------------------------------------------------------- fakes
 
@@ -226,14 +228,14 @@ def test_upsert_uses_real_vectors_and_payload(store, fake_client) -> None:
     coll = fake_client.collections["askmydocs_chunks"]
     assert len(coll.points) == 2
     for c, v in zip(chunks, vectors, strict=True):
-        assert coll.points[c.chunk_id].vector == v
-        assert coll.points[c.chunk_id].payload["text"] == c.text
+        assert coll.points[POINT(c.chunk_id)].vector == v
+        assert coll.points[POINT(c.chunk_id)].payload["text"] == c.text
 
 def test_upsert_zero_vector_fallback(store, fake_client) -> None:
     chunks = _make_chunks("doc-1", 1)
     n = store.upsert(chunks)
     assert n == 1
-    assert fake_client.collections["askmydocs_chunks"].points["doc-1:0"].vector == [0.0] * 1024
+    assert fake_client.collections["askmydocs_chunks"].points[POINT("doc-1:0")].vector == [0.0] * 1024
 
 def test_upsert_rejects_wrong_vector_length(store) -> None:
     chunks = _make_chunks("doc-1", 1)
@@ -258,7 +260,7 @@ def test_search_returns_scored_results(store, fake_client) -> None:
     q = [1.0] + [0.0] * 1023
     results = store.search(q, top_k=2)
     assert len(results) == 2
-    assert results[0]["id"] == "doc-1:0"
+    assert results[0]["id"] == POINT("doc-1:0")
     assert results[0]["score"] >= results[1]["score"]
 
 def test_search_filter_document_ids(store) -> None:
@@ -305,4 +307,4 @@ def test_iter_all_streams_payloads(store) -> None:
     chunks = _make_chunks("doc-1", 4)
     store.upsert(chunks, vectors=[[0.0] * 1024] * 4)
     seen = {row["id"] for row in store.iter_all(batch_size=2)}
-    assert seen == {c.chunk_id for c in chunks}
+    assert seen == {POINT(c.chunk_id) for c in chunks}
