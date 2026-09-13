@@ -34,7 +34,10 @@ concurrency:
 
 jobs:
   ping:
-    name: Ping ${{ env.SPACE_URL }}
+    # NOTE: the `env` context is NOT available in jobs.<id>.name, so this is a
+    # literal (keep it in sync with SPACE_URL below). Using
+    # `${{ env.SPACE_URL }}` here makes the whole workflow invalid.
+    name: Ping Hugging Face Space
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
