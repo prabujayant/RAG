@@ -3,7 +3,7 @@ doc_id: sso-saml
 title: SAML 2.0 Enterprise SSO
 version: 1.0
 module: oauth
-last_updated: 2026-09-06
+last_updated: 2026-09-12
 ---
 
 

@@ -3,7 +3,7 @@ doc_id: oauth-guide
 title: OAuth 2.0 Integration Guide
 version: 1.0
 module: oauth
-last_updated: 2026-09-06
+last_updated: 2026-09-12
 ---
 
 

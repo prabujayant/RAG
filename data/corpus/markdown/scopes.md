@@ -3,7 +3,7 @@ doc_id: scopes
 title: OAuth Scopes and Permissions
 version: 1.0
 module: oauth
-last_updated: 2026-09-06
+last_updated: 2026-09-12
 ---
 
 

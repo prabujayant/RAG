@@ -3,7 +3,7 @@ doc_id: webhooks-guide
 title: Webhooks Guide
 version: 1.0
 module: webhooks
-last_updated: 2026-09-06
+last_updated: 2026-09-12
 ---
 
 

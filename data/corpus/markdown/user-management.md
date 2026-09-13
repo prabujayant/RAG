@@ -3,7 +3,7 @@ doc_id: user-management
 title: User Management
 version: 1.0
 module: users
-last_updated: 2026-09-06
+last_updated: 2026-09-12
 ---
 
 

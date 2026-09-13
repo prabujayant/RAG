@@ -3,7 +3,7 @@ doc_id: database-behavior
 title: Database Behavior
 version: 1.0
 module: database
-last_updated: 2026-09-06
+last_updated: 2026-09-12
 ---
 
 

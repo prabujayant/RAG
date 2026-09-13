@@ -3,7 +3,7 @@ doc_id: security-guide
 title: Security Guide
 version: 1.0
 module: security
-last_updated: 2026-09-06
+last_updated: 2026-09-12
 ---
 
 

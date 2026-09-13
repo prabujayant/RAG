@@ -3,7 +3,7 @@ doc_id: api-keys
 title: API Keys Management
 version: 1.0
 module: authentication
-last_updated: 2026-09-06
+last_updated: 2026-09-12
 ---
 
 

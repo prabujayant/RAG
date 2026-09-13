@@ -3,7 +3,7 @@ doc_id: environments
 title: Environments
 version: 1.0
 module: deployment
-last_updated: 2026-09-06
+last_updated: 2026-09-12
 ---
 
 

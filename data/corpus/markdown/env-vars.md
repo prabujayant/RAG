@@ -3,7 +3,7 @@ doc_id: env-vars
 title: Environment Variables Reference
 version: 1.0
 module: configuration
-last_updated: 2026-09-06
+last_updated: 2026-09-12
 ---
 
 
@@ -18,7 +18,7 @@ The platform is configured through environment variables. Key variables:
 | QDRANT_URL | http://localhost:6333 | Qdrant vector database |
 | OPENSEARCH_URL | http://localhost:9200 | OpenSearch BM25 index |
 | EMBEDDING_MODEL | BAAI/bge-m3 | Embedding model |
-| RERANKER_MODEL | BAAI/bge-reranker-v2-m3 | Cross-encoder reranker |
+| RERANKER_MODEL | cross-encoder/mmarco-mMiniLMv2-L12-H384-v1 | Cross-encoder reranker |
 | OPENROUTER_API_KEY |  | LLM provider key |
 | CHUNK_SIZE | 512 | Chunk size (tokens) |
 | CHUNK_OVERLAP | 64 | Chunk overlap |

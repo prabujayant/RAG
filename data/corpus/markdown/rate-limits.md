@@ -3,7 +3,7 @@ doc_id: rate-limits
 title: Rate Limits and Quotas
 version: 1.0
 module: rate-limits
-last_updated: 2026-09-06
+last_updated: 2026-09-12
 ---
 
 

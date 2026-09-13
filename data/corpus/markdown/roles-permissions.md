@@ -3,7 +3,7 @@ doc_id: roles-permissions
 title: Roles and Permissions
 version: 1.0
 module: users
-last_updated: 2026-09-06
+last_updated: 2026-09-12
 ---
 
 

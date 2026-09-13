@@ -3,7 +3,7 @@ doc_id: monitoring-guide
 title: Monitoring Guide
 version: 1.0
 module: monitoring
-last_updated: 2026-09-06
+last_updated: 2026-09-12
 ---
 
 

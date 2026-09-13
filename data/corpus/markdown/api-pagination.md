@@ -3,7 +3,7 @@ doc_id: api-pagination
 title: Pagination Guide
 version: 1.0
 module: api
-last_updated: 2026-09-06
+last_updated: 2026-09-12
 ---
 
 
