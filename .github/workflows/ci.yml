@@ -27,13 +27,14 @@ jobs:
   # Stage 1: Environment & dependency installation
   # --------------------------------------------------------------------------
   setup:
-    name: Setup Python ${{ env.PYTHON_VERSION }}
+    # NOTE: `env` is NOT available in a job name; use a literal.
+    name: Setup Python
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python ${{ env.PYTHON_VERSION }}
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
