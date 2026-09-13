@@ -1,0 +1,21 @@
+# Cloudflare Tunnel config (Option 1: home PC, no card, $0).
+# 1. Install cloudflared: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/
+# 2. Login once:  cloudflared tunnel login
+# 3. Create once: cloudflared tunnel create askmydocs
+#    (note the Tunnel ID it prints, put it below)
+# 4. Route DNS in Cloudflare dashboard: api.<yourdomain> -> <Tunnel-ID>.cfargotunnel.com
+#    (or use Quick Tunnel for zero-setup testing: cloudflared tunnel --url http://localhost:8000)
+# 5. Copy this file to %USERPROFILE%\.cloudflared\config.yml (Windows) or
+#    ~/.cloudflared/config.yml (Linux/macOS) and run:
+#      cloudflared tunnel run askmydocs
+#
+# The API stays on localhost:8000 — only 443 via Cloudflare is public.
+# No open router/firewall ports needed. DBs remain localhost-only.
+
+tunnel: <TUNNEL-ID>
+credentials-file: C:\Users\<you>\.cloudflared\<TUNNEL-ID>.json
+
+ingress:
+  - hostname: api.example.com   # <-- your public API hostname
+    service: http://localhost:8000
+  - service: http_status:404

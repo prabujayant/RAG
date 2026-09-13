@@ -1,0 +1,6 @@
+# AskMyDocs edge proxy. Automatic HTTPS via Let's Encrypt.
+# Set API_DOMAIN in .env to your DNS name (e.g. api.example.com) pointing at
+# the VM's public IP. Only 80/443 are published; DBs are unreachable publicly.
+{$API_DOMAIN} {
+	reverse_proxy api:8000
+}

@@ -1,0 +1,19 @@
+# Keep the production image lean: code + deps only.
+.venv/
+.venv*/
+.git/
+.github/
+__pycache__/
+*.pyc
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+htmlcov/
+frontend/node_modules/
+frontend/.next/
+data/
+*.md
+!README.md
+.env
+.env.local
+.DS_Store
