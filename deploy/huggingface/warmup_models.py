@@ -1,9 +1,9 @@
 """Build-time model download for the AskMyDocs HF Space image.
 
 Bakes ``BAAI/bge-m3`` and the MiniLM cross-encoder into ``HF_HOME`` so the
-Space does not pay a multi-GB Hub download on first startup. The BAAI repo
-is gated, so the Space must have accepted its license; ``HF_TOKEN`` is
-optional (public access still works once the license is accepted on the Hub).
+Space does not pay a multi-GB Hub download on first startup. Both repos are
+ungated, so no license acceptance is required; ``HF_TOKEN`` is optional and
+only helps with rate limits.
 
 The MiniLM reranker (``cross-encoder/mmarco-mMiniLMv2-L12-H384-v1``, ~118M)
 is the default and runs well on CPU. The heavier ``BAAI/bge-reranker-v2-m3``

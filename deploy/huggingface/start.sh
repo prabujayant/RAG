@@ -27,6 +27,12 @@ RESTORE_ON_BOOT="${RESTORE_ON_BOOT:-false}"
 DATA_ROOT="/home/user"
 
 export PGDATA="${PGDATA:-${DATA_ROOT}/pgdata}"
+# Debian's PostgreSQL defaults unix_socket_directories to /var/run/postgresql,
+# which is owned by postgres:postgres. This container runs as UID 1000, so the
+# postmaster cannot create its lock file there and dies with:
+#   FATAL: could not create lock file "/var/run/postgresql/.s.PGSQL.5432.lock"
+# (surfacing only as "pg_ctl: could not start server"). Use a writable dir.
+export PG_SOCKET_DIR="${PG_SOCKET_DIR:-${DATA_ROOT}/pgsocket}"
 export QDRANT__STORAGE__STORAGE_PATH="${QDRANT__STORAGE__STORAGE_PATH:-${DATA_ROOT}/qdrant_storage}"
 export HF_HOME="${HF_HOME:-${DATA_ROOT}/hf_home}"
 export PATH="/home/user/.local/bin:$PATH"
@@ -90,9 +96,11 @@ if [ ! -f "$PGDATA/PG_VERSION" ]; then
   "$PG_BIN/initdb" -D "$PGDATA" -U "$DB_USER" -A trust -E UTF8 >/dev/null
 fi
 
+mkdir -p "$PG_SOCKET_DIR"
+
 log "starting PostgreSQL"
 "$PG_BIN/pg_ctl" -D "$PGDATA" \
-  -o "-c listen_addresses=127.0.0.1 -c fsync=off -c synchronous_commit=off" \
+  -o "-c listen_addresses=127.0.0.1 -c unix_socket_directories=$PG_SOCKET_DIR -c fsync=off -c synchronous_commit=off" \
   -l "$PGDATA/server.log" -w start >/dev/null
 
 if ! "$PG_BIN/psql" -h 127.0.0.1 -U "$DB_USER" -d postgres -tAc \
@@ -119,34 +127,15 @@ wait_for_port 127.0.0.1 6379 redis 30 || true
 wait_for_port 127.0.0.1 6333 qdrant 60 || true
 
 # --------------------------------------------------------------------------
-# 3. Schema + first-boot corpus ingestion
+# 3. Schema + API + worker + Caddy (supervised)
 # --------------------------------------------------------------------------
 log "initializing database schema"
 python scripts/init_db.py || warn "init_db reported problems; continuing"
 
-chunk_count="$(python - <<'PY' 2>/dev/null | tail -n1 || echo 0
-try:
-    from app.db.session import SessionLocal
-    from app.db.models import Chunk
-
-    with SessionLocal() as s:
-        print(s.query(Chunk).count())
-except Exception:
-    print(0)
-PY
-)"
-chunk_count="${chunk_count:-0}"
-
-if [ "$INGEST_CORPUS" = "true" ] && [ "$chunk_count" -eq 0 ] && [ -d "data/corpus" ]; then
-  log "corpus empty — ingesting data/corpus (may take several minutes on CPU)"
-  python scripts/ingest_corpus.py --root data/corpus || warn "corpus ingest failed"
-else
-  log "skipping corpus ingest (chunks=$chunk_count)"
-fi
-
-# --------------------------------------------------------------------------
-# 4. API + worker + Caddy (supervised)
-# --------------------------------------------------------------------------
+# Servers start BEFORE corpus ingestion so port 7860 is open promptly. HF
+# treats a Space that never binds its port as failed, and first-boot ingestion
+# can take 5-15 minutes on free CPU. Only these are background jobs, so the
+# `wait -n` supervisor below is unaffected by ingestion running afterwards.
 log "starting uvicorn on 127.0.0.1:8000"
 uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1 &
 
@@ -168,6 +157,30 @@ cat > "${DATA_ROOT}/Caddyfile.runtime" <<EOF
 }
 EOF
 caddy run --config "${DATA_ROOT}/Caddyfile.runtime" --adapter caddyfile &
+
+# --------------------------------------------------------------------------
+# 4. First-boot corpus ingestion (servers already serving; /ready flips green
+#    once this finishes and the keyword/vector stores are populated).
+# --------------------------------------------------------------------------
+chunk_count="$(python - <<'PY' 2>/dev/null | tail -n1 || echo 0
+try:
+    from app.db.session import SessionLocal
+    from app.db.models import Chunk
+
+    with SessionLocal() as s:
+        print(s.query(Chunk).count())
+except Exception:
+    print(0)
+PY
+)"
+chunk_count="${chunk_count:-0}"
+
+if [ "$INGEST_CORPUS" = "true" ] && [ "$chunk_count" -eq 0 ] && [ -d "data/corpus" ]; then
+  log "corpus empty — ingesting data/corpus (may take several minutes on CPU)"
+  python scripts/ingest_corpus.py --root data/corpus || warn "corpus ingest failed"
+else
+  log "skipping corpus ingest (chunks=$chunk_count)"
+fi
 
 log "AskMyDocs is up on port ${APP_PORT}"
 wait -n

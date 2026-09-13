@@ -77,9 +77,9 @@ COPY data/uploads_seed/ ./data/uploads_seed/
 
 # ---------------------------------------------------------------------------
 # Build-time warm-up: bake BGE-M3 + the cross-encoder weights into the image.
-# Requires the Space to allow the BAAI model licenses (gated repos).
-# HF_TOKEN is a *build secret*; a failure here leaves the image build usable
-# (the model then downloads on first startup instead).
+# Both repos are ungated (no license acceptance needed). HF_TOKEN is an optional
+# *build secret* for rate-limit relief; a failure here still leaves the image
+# usable (the model then downloads on first startup instead).
 # ---------------------------------------------------------------------------
 RUN --mount=type=secret,id=HF_TOKEN,required=false \
     HF_TOKEN="$(cat /run/secrets/HF_TOKEN 2>/dev/null || true)" \
@@ -89,7 +89,7 @@ RUN --mount=type=secret,id=HF_TOKEN,required=false \
 # Runtime user (HF Spaces use UID 1000) and writable directories.
 # ---------------------------------------------------------------------------
 RUN useradd -m -u 1000 user \
-    && mkdir -p /home/user/pgdata /home/user/qdrant_storage /home/user/app/data/uploads \
+    && mkdir -p /home/user/pgdata /home/user/pgsocket /home/user/qdrant_storage /home/user/app/data/uploads \
     && chown -R user:user /home/user
 
 USER user

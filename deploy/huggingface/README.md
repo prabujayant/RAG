@@ -32,9 +32,9 @@ Deploy AskMyDocs as an all-in-one Docker Space on Hugging Face. The container ru
 
 1. Hugging Face account **on a PRO plan** (see warning above) with a Docker
    Space created
-2. Accepted licenses for gated models:
-   - [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) (accept on the model page)
-3. OpenRouter API key ([openrouter.ai](https://openrouter.ai))
+   - *Not needed:* `BAAI/bge-m3` and the MiniLM reranker are **ungated**, so
+     there is no license to accept.
+2. OpenRouter API key ([openrouter.ai](https://openrouter.ai))
 
 ## Space Secrets
 
@@ -117,8 +117,8 @@ python scripts/hf_state_backup.py --bucket username/askmydocs-data
 ## Troubleshooting
 
 **Build fails on model download:**
-- Accept the BAAI model licenses on Hugging Face Hub
-- Set `HF_TOKEN` secret with a token that has read access
+- Models are ungated, so this is usually a transient Hub or network error
+- Set `HF_TOKEN` secret with a read token if rate-limited
 
 **Cold start is slow:**
 - First boot ingests the corpus (~5-10 min on CPU)
