@@ -116,6 +116,18 @@ python scripts/hf_state_backup.py --bucket username/askmydocs-data
 
 ## Troubleshooting
 
+**`POST /query` returns HTTP 502 (but `/health` is fine):**
+- A non-streamed query is slow on free CPU: the cross-encoder reranking stage
+  dominates (~70s end-to-end in a measured cold run), and the Hugging Face edge
+  proxy drops requests that exceed its timeout, returning 502 while the app keeps
+  working. `/health`, `/ready`, `/docs`, `/metrics` are unaffected.
+- **Use `POST /query/stream`** instead — it emits SSE progress events
+  (`started -> retrieval -> retrieved -> reranking -> evidence -> generation ->
+  grounding -> done`) starting in under a second, so the proxy never times out.
+  The bundled frontend already uses the streaming route.
+- Setting `ENABLE_RERANKER=false` materially cuts query latency if the
+  non-streamed endpoint is required.
+
 **Build fails on model download:**
 - Models are ungated, so this is usually a transient Hub or network error
 - Set `HF_TOKEN` secret with a read token if rate-limited
