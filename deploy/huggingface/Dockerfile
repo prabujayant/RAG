@@ -13,6 +13,23 @@
 # HF Spaces run the container as UID 1000, so every step that writes owned
 # files happens as that user, and no bind-mount tricks are used.
 
+# ---------------------------------------------------------------------------
+# Frontend build stage.
+# The Next.js app is built here, then only the compiled output + the Node
+# runtime are copied into the final image. Its /api/* handlers are dynamic
+# (server-rendered on demand), so a static export is not possible: the UI runs
+# as a real Node server and proxies to the API on 127.0.0.1:8000 (the default
+# in frontend/src/lib), which keeps everything same-origin and avoids CORS.
+# ---------------------------------------------------------------------------
+FROM node:20-slim AS frontend-builder
+WORKDIR /fe
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+# Build, then drop devDependencies so only the production tree is copied into
+# the final image (`next` itself is a runtime dependency).
+RUN npm run build && npm prune --omit=dev
+
 FROM python:3.12-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -63,6 +80,20 @@ RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir .
 # Application code + runtime scripts.
 COPY app ./app
 COPY scripts ./scripts
+
+# Node runtime for the frontend server. Copied explicitly rather than merging
+# all of /usr/local, which would clobber this image's Python installation.
+COPY --from=node:20-slim /usr/local/bin/node /usr/local/bin/node
+COPY --from=node:20-slim /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
+
+# Frontend source + prebuilt .next output + the pruned runtime deps.
+# node_modules is required at runtime: `next start` is invoked from
+# ./node_modules/.bin/next by start.sh.
+COPY frontend ./frontend
+COPY --from=frontend-builder /fe/.next ./frontend/.next
+COPY --from=frontend-builder /fe/node_modules ./frontend/node_modules
 
 # Space entrypoint helpers.
 COPY start.sh ./start.sh

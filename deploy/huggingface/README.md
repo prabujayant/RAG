@@ -63,11 +63,36 @@ HF Spaces have **ephemeral disk** — data is wiped on every restart. To persist
    back up current state to the bucket (`start.sh` downloads
    `https://huggingface.co/buckets/<bucket_id>/resolve/state.tar.zst`)
 
+## Web UI
+
+The Next.js frontend ships **inside this same Space**, so one URL serves both
+the UI and the API and there is no CORS configuration to maintain.
+
+```
+browser --> Caddy :7860 --+-+-> Next.js  127.0.0.1:3000  (UI + /api/* proxy)
+                         \-> uvicorn  127.0.0.1:8000  (/health, /query, ...)
+```
+
+How it works:
+
+1. The image builds the frontend in a `node:20-slim` stage (`npm ci && next build`)
+   and copies only the Node runtime plus `.next` into the final image.
+2. `start.sh` runs `next start` on port 3000. Its `/api/*` route handlers are
+   *dynamic* (server-rendered on demand), so a static export is not possible --
+   the UI needs a real Node server.
+3. Caddy routes API paths (`/health`, `/ready`, `/metrics`, `/docs`, `/query*`,
+   `/documents*`) to uvicorn and everything else to the UI.
+4. The route handlers reach the API at `http://127.0.0.1:8000`, which is the
+   built-in default, so no `NEXT_PUBLIC_API_URL` is required.
+
+Set `RUN_FRONTEND=false` to skip the UI and serve the API only.
+
 ## Ports
 
 | Port | Service | Notes |
 |------|---------|-------|
 | 7860 | Caddy (public) | HF Spaces exposes this port only |
+| 3000 | Next.js UI (internal) | Serves the web interface |
 | 8000 | uvicorn (internal) | FastAPI app |
 | 5432 | PostgreSQL (internal) | Not exposed externally |
 | 6333 | Qdrant (internal) | Not exposed externally |
@@ -83,6 +108,7 @@ All are optional at runtime (defaults match `start.sh`):
 | `APP_PORT` | `7860` | Public port (Caddy) |
 | `INGEST_CORPUS` | `true` | Ingest `data/corpus` on first boot |
 | `RUN_WORKER` | `true` | Start Celery worker |
+| `RUN_FRONTEND` | `true` | Serve the Next.js UI alongside the API |
 | `RESTORE_ON_BOOT` | `false` | Restore state from bucket |
 | `HF_BUCKET` | — | Storage bucket name |
 | `HF_TOKEN` | — | Token for private bucket access |

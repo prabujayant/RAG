@@ -26,7 +26,18 @@ COPY_LIST = [
     "scripts",
     "data/corpus",
     "data/uploads_seed",
+    "frontend",
 ]
+
+# Never ship build artifacts / dependency trees into the Space: node_modules is
+# hundreds of MB and .next is a local build output that the image rebuilds.
+STAGE_IGNORE = shutil.ignore_patterns(
+    "__pycache__",
+    ".pytest_cache",
+    "node_modules",
+    ".next",
+    ".turbo",
+)
 
 DEPLOY_SRC = ROOT / "deploy" / "huggingface"
 DEPLOY_FILES = ["Dockerfile", "start.sh", "warmup_models.py"]
@@ -67,7 +78,7 @@ def stage(output: Path) -> None:
         src = ROOT / rel
         dst = output / rel
         if src.is_dir():
-            shutil.copytree(src, dst, ignore=shutil.ignore_patterns("__pycache__", ".pytest_cache"))
+            shutil.copytree(src, dst, ignore=STAGE_IGNORE)
         elif src.is_file():
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)

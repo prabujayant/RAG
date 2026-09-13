@@ -23,6 +23,7 @@ warn() { printf '\033[1;33m[hf-space]\033[0m %s\n' "$*" >&2; }
 APP_PORT="${APP_PORT:-7860}"
 INGEST_CORPUS="${INGEST_CORPUS:-true}"
 RUN_WORKER="${RUN_WORKER:-true}"
+RUN_FRONTEND="${RUN_FRONTEND:-true}"
 RESTORE_ON_BOOT="${RESTORE_ON_BOOT:-false}"
 DATA_ROOT="/home/user"
 
@@ -146,14 +147,34 @@ if [ "$RUN_WORKER" = "true" ]; then
     --prefetch-multiplier 1 &
 fi
 
-log "starting Caddy on :${APP_PORT} -> 127.0.0.1:8000"
+# Next.js UI on 3000. Its /api/* route handlers proxy to the API above
+# (NEXT_PUBLIC_API_URL defaults to http://127.0.0.1:8000), so the browser only
+# ever talks to this one origin — no CORS configuration needed.
+FRONTEND_DIR="${DATA_ROOT}/app/frontend"
+if [ "$RUN_FRONTEND" = "true" ] && [ -d "$FRONTEND_DIR/.next" ]; then
+  log "starting Next.js UI on 127.0.0.1:3000"
+  ( cd "$FRONTEND_DIR" && PORT=3000 ./node_modules/.bin/next start -p 3000 ) &
+else
+  warn "frontend not started (RUN_FRONTEND=${RUN_FRONTEND}, .next present: $([ -d "$FRONTEND_DIR/.next" ] && echo yes || echo no))"
+fi
+
+log "starting Caddy on :${APP_PORT}"
+# API paths go straight to uvicorn; everything else is the Next.js UI.
+# Caddyfile syntax: a block's braces must not share a line with the opener,
+# so each directive gets its own line.
 cat > "${DATA_ROOT}/Caddyfile.runtime" <<EOF
 {
 	admin off
 	auto_https off
 }
 :${APP_PORT} {
-	reverse_proxy 127.0.0.1:8000
+	@api path /health* /ready* /metrics* /docs* /redoc* /openapi.json /query* /documents*
+	handle @api {
+		reverse_proxy 127.0.0.1:8000
+	}
+	handle {
+		reverse_proxy 127.0.0.1:3000
+	}
 }
 EOF
 caddy run --config "${DATA_ROOT}/Caddyfile.runtime" --adapter caddyfile &
