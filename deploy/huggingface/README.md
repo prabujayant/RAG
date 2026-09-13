@@ -87,6 +87,35 @@ How it works:
 
 Set `RUN_FRONTEND=false` to skip the UI and serve the API only.
 
+## Keeping the Space warm
+
+Free `cpu-basic` Spaces are suspended after **~48 hours without traffic**, and
+Hugging Face will not let you change that on free hardware:
+
+```
+Bad request: Cannot change the sleep time for CPU Basic Spaces
+```
+
+When a slept Space is visited it restarts cold, which costs the model load plus
+a full corpus re-ingest (~15 minutes on CPU). Two things mitigate this:
+
+1. **Any real visit resets the inactivity timer**, so normal use keeps it warm.
+2. **`.github/workflows/keep-warm.yml`** pings `/health` every 10 minutes
+   (plus a best-effort `/documents` call) so the timer never elapses.
+
+Caveats to be aware of:
+
+- GitHub's scheduler is best-effort — runs can be delayed several minutes.
+- GitHub **disables scheduled workflows after 60 days of repo inactivity**.
+  Push a commit, use *Actions -> Keep Space warm -> Run workflow*, or add an
+  external uptime monitor (UptimeRobot, cron-job.org) as an independent backup.
+- The pinger cannot help after a **rebuild or redeploy** — that always starts a
+  fresh container and re-ingests. Persist state with `HF_BUCKET` to avoid it.
+- Permanently warm free Spaces consume shared community resources; if this ever
+  becomes a problem, prefer the Oracle path in [`DEPLOY.md`](../../DEPLOY.md).
+
+To stop the pinger, disable the workflow in the repo's **Actions** tab.
+
 ## Ports
 
 | Port | Service | Notes |
