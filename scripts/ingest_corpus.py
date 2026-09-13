@@ -73,6 +73,16 @@ def main() -> int:
         default=str(ROOT / "data" / "corpus"),
         help="Corpus root directory (default: data/corpus)",
     )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help=(
+            "Ingest at most N documents (0 = no limit). Files are sorted, so "
+            "the selection is deterministic. Useful on slow CPU where the full "
+            "corpus would take many minutes."
+        ),
+    )
     args = parser.parse_args()
 
     root = Path(args.root)
@@ -80,6 +90,9 @@ def main() -> int:
     if not files:
         print(f"No supported documents found under {root}")
         return 1
+
+    if args.limit and args.limit > 0:
+        files = files[: args.limit]
 
     print(f"Found {len(files)} documents to ingest under {root}")
 

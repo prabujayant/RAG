@@ -202,8 +202,14 @@ if [ "$INGEST_CORPUS" = "true" ] && [ "$chunk_count" -eq 0 ] && [ -d "data/corpu
   # uploads (queued on the Celery worker) sat there for 5+ minutes with the UI
   # stuck on "Parsing, embedding and indexing...". With `nice`, uploads and
   # queries always win; the corpus still finishes, just in the background.
-  log "corpus empty — ingesting data/corpus at low priority (may take 20+ min on CPU)"
-  nice -n 19 python scripts/ingest_corpus.py --root data/corpus \
+  #
+  # CORPUS_INGEST_LIMIT caps how many documents are ingested (default 5). The
+  # full 46-doc corpus took ~23 min at ~2 docs/min on 2 vCPU, which made the
+  # Space unusable for uploads after every restart. Five docs boot in ~2.5 min.
+  # Set CORPUS_INGEST_LIMIT=0 to ingest everything.
+  limit="${CORPUS_INGEST_LIMIT:-5}"
+  log "corpus empty — ingesting data/corpus (limit=${limit}, low priority)"
+  nice -n 19 python scripts/ingest_corpus.py --root data/corpus --limit "$limit" \
     || warn "corpus ingest failed"
 else
   log "skipping corpus ingest (chunks=$chunk_count)"
