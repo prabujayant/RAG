@@ -64,7 +64,6 @@ export function QueryComposer({
             variant="ghost"
             size="icon"
             onClick={toggle}
-            disabled={disabled}
             aria-pressed={listening}
             aria-label={listening ? "Stop voice input" : "Start voice input"}
             title={
