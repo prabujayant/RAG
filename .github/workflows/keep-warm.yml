@@ -1,0 +1,67 @@
+# =============================================================================
+# Keep-warm pinger for the Hugging Face Space.
+#
+# Free HF Spaces (cpu-basic) are suspended after ~48h without traffic; the next
+# visitor triggers a cold restart (model load + corpus re-ingest). This workflow
+# sends periodic traffic so the inactivity timer never elapses and the backend
+# stays responsive without a cold start.
+#
+# Notes / limitations (be honest about these):
+#   * GitHub's scheduler is best-effort: runs are often delayed by several
+#     minutes, and the shortest practical interval is ~5 min.
+#   * GitHub disables scheduled workflows in repos with no activity for 60 days.
+#     Push a commit, click "Run workflow", or add an external uptime monitor
+#     (e.g. UptimeRobot, cron-job.org) as a backup.
+#   * HF does not allow disabling sleep on cpu-basic
+#     ("Cannot change the sleep time for CPU Basic Spaces"), so pinging is the
+#     only free way to stay warm.
+# =============================================================================
+
+name: Keep Space warm
+
+on:
+  schedule:
+    # Every 10 minutes. Cron is UTC and may be delayed by GitHub under load.
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+env:
+  SPACE_URL: https://prabu17-rvce.hf.space
+
+concurrency:
+  group: keep-warm
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    name: Ping ${{ env.SPACE_URL }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Ping /health (retries cover a sleeping Space waking up)
+        run: |
+          set -u
+          url="${SPACE_URL}/health"
+          echo "Pinging ${url}"
+          for attempt in 1 2 3 4 5 6; do
+            code=$(curl -sS -o /tmp/body.txt -w "%{http_code}" \
+              --max-time 120 --retry 1 "$url" 2>/dev/null || echo "000")
+            body=$(head -c 200 /tmp/body.txt 2>/dev/null || true)
+            echo "attempt ${attempt}: HTTP ${code} ${body}"
+            if [ "$code" = "200" ] && printf '%s' "$body" | grep -q '"status"'; then
+              echo "Space is warm."
+              exit 0
+            fi
+            sleep 25
+          done
+          echo "Space did not become healthy; it may still be cold-starting."
+          exit 1
+
+      - name: Warm the retriever (best effort, non-blocking)
+        # /health only proves the process is up. This exercises the retrieval
+        # path so embeddings/Qdrant stay in the container's working set.
+        # Failures are ignored: the Space is considered warm either way.
+        continue-on-error: true
+        run: |
+          curl -sS -o /dev/null -w "documents -> HTTP %{http_code}\n" \
+            --max-time 120 "${SPACE_URL}/documents" || true
