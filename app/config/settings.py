@@ -31,6 +31,13 @@ class Settings(BaseSettings):
 
     # ---- Application -------------------------------------------------------
     app_env: str = Field(default="development", description="Runtime environment")
+    cors_origins: str = Field(
+        default="*",
+        description=(
+            "Comma-separated CORS origins (e.g. 'https://askmydocs.vercel.app'). "
+            "Default '*' keeps local dev working; set explicitly in production."
+        ),
+    )
     log_level: str = Field(default="INFO")
     log_format: str = Field(
         default="pretty",
@@ -56,19 +63,27 @@ class Settings(BaseSettings):
     qdrant_collection: str = Field(default="askmydocs_chunks")
     qdrant_distance: str = Field(default="Cosine", description="Similarity metric (Cosine | Euclid | Dot)")
 
-    # ---- OpenSearch (BM25) --------------------------------------------------
-    opensearch_url: str = Field(default="http://localhost:9200")
-    opensearch_username: str = Field(default="")
-    opensearch_password: str = Field(default="")
-    opensearch_index: str = Field(default="askmydocs_chunks")
-
     # ---- Embeddings ----------------------------------------------------------
     embedding_model: str = Field(default="BAAI/bge-m3")
     embedding_dim: int = Field(default=1024)
-    embedding_batch_size: int = Field(default=16)
+    embedding_batch_size: int = Field(default=64)
+    warmup_models: bool = Field(
+        default=True,
+        description=(
+            "Pre-load the embedding model during app startup so the first "
+            "query doesn't pay the ~50s cold-start cost. Set to false to "
+            "keep startup fast (e.g. in tests)."
+        ),
+    )
 
     # ---- Re-ranker ------------------------------------------------------------
-    reranker_model: str = Field(default="BAAI/bge-reranker-v2-m3")
+    # Multilingual MiniLM cross-encoder (~118M params). Measured 19.6x faster
+    # than BAAI/bge-reranker-v2-m3 (568M) on CPU: 404 ms/pair vs 7898 ms/pair,
+    # with strong ranking margins across EN/DE/ID. The larger model is still
+    # selectable via RERANKER_MODEL when maximum accuracy is required.
+    reranker_model: str = Field(
+        default="cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
+    )
     enable_reranker: bool = Field(default=True)
     rerank_top_k: int = Field(default=8, ge=1)
 
@@ -76,6 +91,12 @@ class Settings(BaseSettings):
     chunk_strategy: str = Field(default="paragraph")
     chunk_size: int = Field(default=512)
     chunk_overlap: int = Field(default=64)
+
+    # ---- Ingestion / uploads ----------------------------------------------------
+    upload_dir: str = Field(
+        default="data/uploads",
+        description="Directory where uploaded documents are persisted before ingestion",
+    )
 
     # ---- Retrieval -------------------------------------------------------------
     bm25_top_k: int = Field(default=20, ge=1)
@@ -87,13 +108,49 @@ class Settings(BaseSettings):
 
     # ---- LLM (OpenRouter) ------------------------------------------------------
     openrouter_api_key: str = Field(default="")
-    openrouter_model: str = Field(default="openai/gpt-4o-mini")
+    # Fastest free model measured (median 1.6s, valid JSON + citations on 3/3
+    # runs). See .env for the full free-model benchmark. Reasoning models emit
+    # hidden reasoning tokens, so max_answer_tokens must stay high.
+    openrouter_model: str = Field(default="nex-agi/nex-n2.5-mini:free")
     openrouter_base_url: str = Field(default="https://openrouter.ai/api/v1")
-    llm_timeout_seconds: float = Field(default=60.0)
+    llm_timeout_seconds: float = Field(
+        default=60.0,
+        description=(
+            "HTTP timeout for LLM calls. Raise this if you switch to a "
+            "reasoning model, which can spend 60s+ thinking before answering."
+        ),
+    )
     llm_max_retries: int = Field(default=2)
+    llm_reasoning_effort: str = Field(
+        default="high",
+        description=(
+            "Reasoning effort for reasoning models (high|medium|low|none), sent "
+            "as OpenRouter's `reasoning.effort`. Lower values cut latency a lot "
+            "(reasoning tokens dominate generation time) but may hurt answer "
+            "quality — A/B before lowering in production. 'high' sends no "
+            "parameter (provider default), so the default path is unchanged."
+        ),
+    )
+    llm_json_mode: bool = Field(
+        default=True,
+        description=(
+            "Request OpenAI-style JSON mode (response_format=json_object) so "
+            "the model returns a JSON payload in `content` instead of prose "
+            "or chain-of-thought. Skipped automatically if the provider "
+            "rejects the parameter."
+        ),
+    )
 
     # ---- Grounding / answers ----------------------------------------------------
-    max_answer_tokens: int = Field(default=400)
+    max_answer_tokens: int = Field(
+        default=8192,
+        description=(
+            "Max completion tokens for answer generation. Must cover the "
+            "model's reasoning tokens (if any) plus the JSON answer, or the "
+            "response is truncated mid-JSON and cannot be parsed. Raise this "
+            "if you switch to a reasoning model."
+        ),
+    )
     confidence_threshold: float = Field(default=0.5)
 
     # ---- Observability (Langfuse) ------------------------------------------------
@@ -106,6 +163,32 @@ class Settings(BaseSettings):
     eval_dataset_path: str = Field(default="evals/dataset/golden.jsonl")
     eval_rerank_enabled: bool = Field(default=True)
 
+    # ---- Celery -------------------------------------------------------------------
+    celery_broker_url: str = Field(
+        default="redis://localhost:6379/0",
+        description="Redis broker URL for Celery task queue",
+    )
+    celery_result_backend: str = Field(
+        default="redis://localhost:6379/1",
+        description="Redis backend URL for Celery results",
+    )
+    celery_task_track_started: bool = Field(
+        default=True,
+        description="Track task start time for progress monitoring",
+    )
+    celery_task_ignore_result: bool = Field(
+        default=False,
+        description="Store task results for retrieval",
+    )
+    celery_worker_prefetch_multiplier: int = Field(default=4, ge=1)
+    celery_task_time_limit: int = Field(
+        default=3600,
+        description="Hard time limit per task (seconds)",
+    )
+    celery_task_soft_time_limit: int = Field(
+        default=3000,
+        description="Soft time limit per task (seconds)",
+    )
 
     @property
     def langfuse_enabled(self) -> bool:

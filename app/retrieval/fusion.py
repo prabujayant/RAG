@@ -16,6 +16,8 @@ Reference:
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from app.retrieval.models import RetrievalResult, RetrieverType
 
 
@@ -38,7 +40,7 @@ def reciprocal_rank_fusion(
     -------
     list[RetrievalResult]
         Fused and deduplicated results sorted by RRF score (descending).
-        Ties are broken by the retriever type order then original rank.
+        Ties are broken by chunk_id ascending for determinism.
 
     Examples
     --------
@@ -83,13 +85,20 @@ def reciprocal_rank_fusion(
         reverse=True,
     )
 
-    # Re-assign ranks and mark as HYBRID retriever
+    # Re-assign ranks and mark as HYBRID retriever.
+    # Use replace() so caller-owned RetrievalResult objects are never mutated.
+    fused_copies: list[RetrievalResult] = []
     for idx, result in enumerate(fused):
-        result.rank = idx
-        result.retriever = RetrieverType.HYBRID
-        # Copy metadata and inject the set of contributing retrievers
-        result.metadata = dict(result.metadata)
-        result.metadata["contributing_retrievers"] = chunk_contributors[result.chunk_id]
-        result.score = chunk_scores[result.chunk_id]
+        metadata = dict(result.metadata)
+        metadata["contributing_retrievers"] = chunk_contributors[result.chunk_id]
+        fused_copies.append(
+            replace(
+                result,
+                rank=idx,
+                retriever=RetrieverType.HYBRID,
+                score=chunk_scores[result.chunk_id],
+                metadata=metadata,
+            )
+        )
 
-    return fused
+    return fused_copies

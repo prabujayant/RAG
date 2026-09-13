@@ -14,6 +14,9 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Iterable
+from functools import lru_cache
+from threading import Lock
+from weakref import WeakKeyDictionary
 
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qm
@@ -25,6 +28,59 @@ from app.config.settings import Settings
 from app.ingestion.chunker import Chunk
 
 logger = logging.getLogger(__name__)
+
+# Qdrant clients are expensive to build (each owns an HTTP connection pool) and
+# were previously constructed per request, so no connection was ever reused.
+# Cache one client per URL for the whole process instead.
+#
+# Keyed by the client *object* (weakly) rather than by ``id(client)``: Python
+# recycles ``id()`` values once an object is garbage collected, so an id-keyed
+# set could report a brand-new client as "already ensured" and skip creating its
+# collection entirely. Weak keys also drop the entry automatically when a client
+# goes away.
+_ENSURED_COLLECTIONS: WeakKeyDictionary[object, set[str]] = WeakKeyDictionary()
+_ENSURED_LOCK = Lock()
+
+
+def _is_collection_ensured(client: object, collection: str) -> bool:
+    """True when *client* has already been confirmed to hold *collection*."""
+    try:
+        with _ENSURED_LOCK:
+            return collection in _ENSURED_COLLECTIONS.get(client, ())
+    except TypeError:
+        # Client is not weak-referenceable — fall back to always checking.
+        return False
+
+
+def _mark_collection_ensured(client: object, collection: str) -> None:
+    """Record that *client* is known to hold *collection*."""
+    try:
+        with _ENSURED_LOCK:
+            _ENSURED_COLLECTIONS.setdefault(client, set()).add(collection)
+    except TypeError:
+        # Not weak-referenceable; skip memoization rather than fail the call.
+        pass
+
+
+def _forget_collection(client: object, collection: str) -> None:
+    """Drop the memoized entry for a deleted collection."""
+    try:
+        with _ENSURED_LOCK:
+            ensured = _ENSURED_COLLECTIONS.get(client)
+            if ensured is not None:
+                ensured.discard(collection)
+    except TypeError:
+        pass
+
+
+@lru_cache(maxsize=8)
+def _get_shared_qdrant_client(url: str, timeout: int = 30) -> QdrantClient:
+    """Return a process-wide :class:`QdrantClient` for ``url``.
+
+    Reusing a single client preserves its underlying HTTP connection pool, so
+    requests skip the per-query TCP/TLS handshake and socket churn.
+    """
+    return QdrantClient(url=url, timeout=timeout)
 
 
 def _point_id(chunk_id: str) -> str:
@@ -73,14 +129,22 @@ class VectorStore:
         self.collection = s.qdrant_collection
         self.vector_size = s.embedding_dim
         self.distance = Distance[s.qdrant_distance.upper()]
-        self._client = client or QdrantClient(url=s.qdrant_url, timeout=30)
+        self._client = client or _get_shared_qdrant_client(s.qdrant_url, 30)
 
     # ------------------------------------------------------------------ admin
 
     def ensure_collection(self) -> None:
-        """Create the collection (BGE-M3 unnamed default vector) if missing."""
+        """Create the collection (BGE-M3 unnamed default vector) if missing.
+
+        The existence check is memoized per ``(client, collection)`` so the hot
+        search path doesn't pay a redundant ``get_collections`` round-trip on
+        every query.
+        """
+        if _is_collection_ensured(self._client, self.collection):
+            return
         existing = {c.name for c in self._client.get_collections().collections}
         if self.collection in existing:
+            _mark_collection_ensured(self._client, self.collection)
             return
         try:
             self._client.create_collection(
@@ -94,6 +158,7 @@ class VectorStore:
             # Race: another process created it concurrently.
             if "already exists" not in str(exc).lower():
                 raise
+        _mark_collection_ensured(self._client, self.collection)
         logger.info("Created Qdrant collection %s", self.collection)
 
     def delete_collection(self) -> None:
@@ -102,6 +167,7 @@ class VectorStore:
             self._client.delete_collection(collection_name=self.collection)
         except UnexpectedResponse:
             return
+        _forget_collection(self._client, self.collection)
         logger.info("Deleted Qdrant collection %s", self.collection)
 
     # ----------------------------------------------------------------- writes
@@ -188,20 +254,27 @@ class VectorStore:
         query_vector: list[float],
         top_k: int = 20,
         filter_document_ids: list[str] | None = None,
+        exclude_document_ids: list[str] | None = None,
         score_threshold: float | None = None,
     ) -> list[dict]:
         """Search for the top-k nearest chunks by configured similarity."""
         self.ensure_collection()
-        flt: qm.Filter | None = None
+        clauses: dict = {}
         if filter_document_ids:
-            flt = qm.Filter(
-                must=[
-                    qm.FieldCondition(
-                        key="document_id",
-                        match=qm.MatchAny(any=filter_document_ids),
-                    )
-                ]
-            )
+            clauses["must"] = [
+                qm.FieldCondition(
+                    key="document_id",
+                    match=qm.MatchAny(any=filter_document_ids),
+                )
+            ]
+        if exclude_document_ids:
+            clauses["must_not"] = [
+                qm.FieldCondition(
+                    key="document_id",
+                    match=qm.MatchAny(any=exclude_document_ids),
+                )
+            ]
+        flt: qm.Filter | None = qm.Filter(**clauses) if clauses else None
         results = self._client.query_points(
             collection_name=self.collection,
             query=query_vector,

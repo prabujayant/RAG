@@ -10,7 +10,7 @@ from pydantic import ValidationError
 def test_defaults_match_spec() -> None:
     s = Settings()
     assert s.embedding_model == "BAAI/bge-m3"
-    assert s.reranker_model == "BAAI/bge-reranker-v2-m3"
+    assert s.reranker_model == "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
     assert s.enable_reranker is True
     assert s.chunk_strategy == "paragraph"
     assert s.rrf_k == 60

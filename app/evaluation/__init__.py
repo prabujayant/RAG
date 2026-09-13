@@ -23,11 +23,15 @@ from app.evaluation.ragas_eval import (
     RagasEvaluator,
 )
 from app.evaluation.regression import (
+    MetricThreshold,
     RegressionEntry,
     RegressionReport,
+    ThresholdSet,
     check_regression,
     compare_baseline,
     load_baseline,
+    load_thresholds,
+    resolve_thresholds,
     save_baseline,
 )
 from app.evaluation.retrieval_metrics import (
@@ -76,11 +80,15 @@ __all__ = [
     "ExperimentResults",
     "run_evaluation",
     # regression
+    "MetricThreshold",
+    "ThresholdSet",
     "RegressionEntry",
     "RegressionReport",
     "check_regression",
     "compare_baseline",
     "load_baseline",
+    "load_thresholds",
+    "resolve_thresholds",
     "save_baseline",
     # CLI
     "run_cli",

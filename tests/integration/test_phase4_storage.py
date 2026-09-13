@@ -2,12 +2,13 @@
 
 These tests wire the full Phase 4 stack together:
 
-    chunker → embedder → VectorStore (Qdrant) → BM25Indexer (OpenSearch)
+    chunker → embedder → VectorStore (Qdrant) → BM25Indexer (Postgres tsvector)
 
-They use **in-memory fakes** for Qdrant and OpenSearch (no docker) so the
-suite runs in CI without infra. The embedder uses a tiny deterministic
+They use **in-memory fakes** for Qdrant and keyword postings (no docker) so
+the suite runs in CI without infra. The embedder uses a tiny deterministic
 stub encoder (no BGE-M3 download) but preserves the real shape of the
-data flowing through the stack.
+data flowing through the stack. Real tsvector ranking is covered by the
+live-Postgres smoke test (requires_docker).
 """
 
 from __future__ import annotations
@@ -19,7 +20,6 @@ import numpy as np
 import pytest
 from app.embeddings.embedder import BGE_M3_DIM, Embedder
 from app.ingestion.chunker import Chunker, ChunkingStrategy
-from app.retrieval.bm25 import BM25Indexer
 from app.retrieval.vector import VectorStore
 
 # ---------------------------------------------------------------- fakes
@@ -158,107 +158,73 @@ def _cosine(a, b):  # noqa: ANN001
     nb = math.sqrt(sum(x * x for x in b)) or 1e-9
     return dot / (na * nb)
 
-class _NotFoundError(Exception):
-    pass
+class _FakeKeyword:
+    """In-memory stand-in with the BM25Indexer method surface.
 
-class _FakeOS:
-    NotFoundError = _NotFoundError
+    Tests pipeline wiring (every chunk reaches every store); real ranking
+    lives in Postgres and is covered by the live-PG smoke test.
+    """
 
     def __init__(self) -> None:
-        self.indices_map: dict[str, dict] = {}
-        self.docs: dict[str, dict[str, dict]] = {}
+        self.postings: dict[str, dict] = {}
 
-    class _IndicesClient:
-        def __init__(self, parent: _FakeOS) -> None:
-            self.parent = parent
+    def ensure_index(self) -> None:
+        return None
 
-        def exists(self, index) -> bool:
-            return index in self.parent.indices_map
-
-        def create(self, index, body) -> dict:
-            if index not in self.parent.indices_map:
-                self.parent.indices_map[index] = body
-                self.parent.docs.setdefault(index, {})
-            return {}
-
-        def delete(self, index) -> dict:
-            self.parent.indices_map.pop(index, None)
-            self.parent.docs.pop(index, None)
-            return {}
-
-    @property
-    def indices(self) -> _FakeOS._IndicesClient:
-        return _FakeOS._IndicesClient(self)
-
-    def exists(self, index) -> bool:
-        return index in self.indices_map
-
-    def create(self, index, body) -> dict:
-        self.indices_map[index] = body
-        self.docs.setdefault(index, {})
-        return {}
-
-    def delete(self, index) -> dict:
-        self.indices_map.pop(index, None)
-        self.docs.pop(index, None)
-        return {}
-
-    def bulk(self, body, refresh=False):  # noqa: ARG002
-        items = []
-        i = 0
-        while i < len(body):
-            op = body[i]
-            if "index" in op:
-                meta = op["index"]
-                self.docs.setdefault(meta["_index"], {})[meta["_id"]] = body[i + 1]
-                items.append({"index": {"status": 201}})
-                i += 2
-            else:
-                i += 1
-        return {"errors": False, "items": items}
-
-    def get(self, index, id):
-        if id not in self.docs.get(index, {}):
-            raise _NotFoundError()
-        return {"_source": self.docs[index][id]}
-
-    def count(self, index, body):
-        if index not in self.indices_map:
-            raise _NotFoundError()
-        if body["query"] == {"match_all": {}}:
-            return {"count": len(self.docs[index])}
-        return {"count": 0}
-
-    def search(self, index, body):
-        if index not in self.indices_map:
-            return {"hits": {"hits": []}}
-        size = body.get("size", 10)
-        # Naive contains-match score so test is deterministic.
-        query = body["query"]["bool"]["must"][0]["multi_match"]["query"]
-        hits = []
-        for doc_id, src in self.docs[index].items():
-            text = (src.get("text") or "").lower()
-            q = query.lower()
-            score = float(text.count(q)) if q in text else 0.0
-            if score > 0:
-                hits.append((score, doc_id, src))
-        hits.sort(key=lambda x: x[0], reverse=True)
-        return {
-            "hits": {
-                "hits": [
-                    {"_id": did, "_score": s, "_source": src} for s, did, src in hits[:size]
-                ]
+    def index_documents(self, chunks, refresh: bool = True) -> None:  # noqa: ARG002, ANN001
+        for c in chunks:
+            self.postings[c.chunk_id] = {
+                "document_id": c.document_id,
+                "text": c.text,
+                "source": c.source,
+                "page_number": c.page_number,
+                "section": c.section,
             }
-        }
 
-    def delete_by_query(self, index, body, refresh=True, conflicts="proceed"):  # noqa: ARG002
-        if index not in self.indices_map:
-            raise _NotFoundError()
-        term = body["query"].get("term", {}).get("document_id")
-        to_delete = [d for d, s in list(self.docs[index].items()) if s.get("document_id") == term]
-        for d in to_delete:
-            del self.docs[index][d]
-        return {"deleted": len(to_delete)}
+    def upsert(self, chunks) -> int:  # noqa: ANN001
+        items = list(chunks)
+        self.index_documents(items)
+        return len(items)
+
+    def search(self, query, top_k=20, filter_document_ids=None, exclude_document_ids=None, fields=None):  # noqa: ANN001
+        q = (query or "").lower()
+        hits = []
+        for pid, src in self.postings.items():
+            if filter_document_ids and src["document_id"] not in filter_document_ids:
+                continue
+            if exclude_document_ids and src["document_id"] in exclude_document_ids:
+                continue
+            text = (src.get("text") or "").lower()
+            score = float(text.count(q)) if q and q in text else 0.0
+            if score > 0:
+                hits.append({"id": pid, "score": score, "payload": dict(src)})
+        hits.sort(key=lambda h: h["score"], reverse=True)
+        return hits[:top_k]
+
+    def get(self, chunk_id):
+        src = self.postings.get(chunk_id)
+        return dict(src) if src else None
+
+    def count(self, document_id=None):
+        if document_id is None:
+            return len(self.postings)
+        return sum(1 for s in self.postings.values() if s["document_id"] == document_id)
+
+    def delete_by_document(self, document_id, refresh: bool = True) -> int:  # noqa: ARG002
+        doomed = [p for p, s in self.postings.items() if s["document_id"] == document_id]
+        for p in doomed:
+            del self.postings[p]
+        return len(doomed)
+
+    def delete_by_ids(self, chunk_ids, refresh: bool = True) -> int:  # noqa: ARG002
+        n = 0
+        for cid in chunk_ids:
+            if self.postings.pop(cid, None) is not None:
+                n += 1
+        return n
+
+    def delete_index(self) -> None:
+        self.postings.clear()
 
 # ---------------------------------------------------------------- embedder stub
 
@@ -285,11 +251,11 @@ def qdrant() -> _FakeQdrant:
     return _FakeQdrant()
 
 @pytest.fixture
-def opensearch() -> _FakeOS:
-    return _FakeOS()
+def keyword() -> _FakeKeyword:
+    return _FakeKeyword()
 
 @pytest.fixture
-def embedder(qdrant, opensearch):  # noqa: ARG001
+def embedder(qdrant, keyword):  # noqa: ARG001
     e = Embedder()
     e._model = _StubEncoder()
     return e
@@ -299,8 +265,8 @@ def vector_store(qdrant) -> VectorStore:
     return VectorStore(client=qdrant)
 
 @pytest.fixture
-def bm25(opensearch) -> BM25Indexer:
-    return BM25Indexer(client=opensearch)
+def bm25(keyword) -> _FakeKeyword:
+    return keyword
 
 # -------------------------------------------------------------- helpers
 
@@ -393,7 +359,7 @@ def test_delete_chunks_by_document_clears_all_stores(vector_store, bm25, embedde
     assert vector_store.count() == 1 and bm25.count() == 1
 
 def test_ingestion_pipeline_writes_to_all_stores(  # noqa: E501
-    monkeypatch, qdrant, opensearch, embedder, vector_store, bm25
+    monkeypatch, qdrant, keyword, embedder, vector_store, bm25
 ) -> None:
     """End-to-end through the real IngestionPipeline but with fake stores."""
     # Patch the DB engine to an in-memory SQLite so the test does not need PG.
@@ -417,7 +383,7 @@ def test_ingestion_pipeline_writes_to_all_stores(  # noqa: E501
     from app.retrieval import vector as v_mod
 
     monkeypatch.setattr(v_mod, "VectorStore", lambda *_a, **_k: VectorStore(settings=None, client=qdrant))
-    monkeypatch.setattr(b_mod, "BM25Indexer", lambda *_a, **_k: BM25Indexer(settings=None, client=opensearch))
+    monkeypatch.setattr(b_mod, "BM25Indexer", lambda *_a, **_k: keyword)
 
     pipeline = IngestionPipeline(embedder=embedder)
     res = pipeline.ingest("data/corpus/markdown/authentication-guide.md", title="Authentication Guide")

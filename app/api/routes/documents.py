@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
-import tempfile
+import threading
+import time
+import uuid
 from datetime import datetime
+from pathlib import Path
 
-from fastapi import APIRouter, File, HTTPException, Response, UploadFile, status
+from fastapi import APIRouter, File, HTTPException, Query, Response, UploadFile, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 
 from app.api.schemas.common import ErrorResponse
@@ -22,29 +27,82 @@ from app.api.schemas.documents import (
     JobStatus,
     validate_file_extension,
 )
+from app.config import get_settings
 from app.db.models import Document, IngestionJob
 from app.db.session import SessionLocal
-from app.ingestion.pipeline import IngestionPipeline
+from app.ingestion.pipeline import IngestionPipeline, _doc_id_from_path
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/documents", tags=["documents"])
+
+# How long a successful worker detection stays valid. Avoids re-probing (and
+# risking a blocking ping) on every upload while still noticing a stopped
+# worker within the TTL.
+_WORKER_PROBE_TTL = 30.0
+_worker_probe_cache: dict[str, float] = {}
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _doc_id_from_path(file_path: str) -> str:
-    """Stable SHA-1 document ID from an absolute file path."""
-    return hashlib.sha1(file_path.encode("utf-8")).hexdigest()[:32]
+def _persist_upload(upload_file: UploadFile) -> tuple[str, str]:
+    """Persist an upload under a content-addressed directory.
 
+    The file is streamed to a temporary name while a SHA-1 of its bytes is
+    computed, then moved to ``<upload_dir>/<content_hash>/<filename>``. Only the
+    basename of the client-supplied name is used, so a crafted name cannot
+    escape the upload directory.
 
-def _save_upload_file(upload_file: UploadFile, dest_dir: str) -> str:
-    """Save an UploadFile to *dest_dir* and return the absolute file path."""
+    Addressing by content hash makes re-uploading the same file resolve to the
+    same document ID, so the pipeline upserts the existing chunks instead of
+    indexing a duplicate copy.
+
+    Returns ``(absolute_path, content_hash)``.
+    """
+    base_dir = _upload_destination()
+    safe_name = os.path.basename(upload_file.filename or "upload")
+
+    incoming_dir = os.path.join(base_dir, ".incoming")
+    os.makedirs(incoming_dir, exist_ok=True)
+    tmp_path = os.path.join(incoming_dir, f"{uuid.uuid4().hex}_{safe_name}")
+
+    digest = hashlib.sha1()
+    with open(tmp_path, "wb") as f:
+        while True:
+            block = upload_file.file.read(1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+            f.write(block)
+
+    content_hash = digest.hexdigest()[:12]
+    dest_dir = os.path.join(base_dir, content_hash)
     os.makedirs(dest_dir, exist_ok=True)
-    file_path = os.path.join(dest_dir, upload_file.filename or "upload")
-    with open(file_path, "wb") as f:
-        shutil_copyfileobj(upload_file.file, f)
-    return file_path
+    dest_path = os.path.abspath(os.path.join(dest_dir, safe_name))
+
+    # The directory name *is* the content hash, so if the destination already
+    # exists it holds byte-identical content. Reuse it and discard our copy:
+    # writing under a suffixed name here would create a second document for the
+    # same file and make the content appear twice in retrieval results.
+    if os.path.exists(dest_path):
+        os.remove(tmp_path)
+        return dest_path, content_hash
+
+    try:
+        os.replace(tmp_path, dest_path)
+    except PermissionError:
+        # Windows can still refuse if the destination appeared and is held open
+        # between the check above and this move. Same reasoning applies: the
+        # existing file has identical content, so keep it and discard ours.
+        os.remove(tmp_path)
+    return dest_path, content_hash
+
+
+def _upload_destination() -> str:
+    """Return the directory that uploads are persisted into."""
+    return get_settings().upload_dir
 
 
 def _validate_upload(file: UploadFile) -> None:
@@ -106,6 +164,86 @@ def _create_document_record(
     return doc
 
 
+def _celery_worker_available(timeout: float = 0.5) -> bool:
+    """Return True when at least one Celery worker answers a control ping.
+
+    Two hazards shape this probe:
+
+    * ``control.ping`` travels over the broker. A single-threaded
+      (``--pool=solo``) worker that is *busy* executing a task does not process
+      the control message until it finishes, so a naive ping blocks the caller
+      for the whole task duration — which stalled uploads for ~25s while a
+      previous ingest was running.
+    * A reachable broker is not a running worker. Skipping the check entirely
+      strands tasks in Redis, leaving documents stuck in ``processing``.
+
+    The probe therefore runs on a daemon thread with a hard deadline and a
+    positive verdict is cached briefly. If the deadline expires we fail *open*
+    (assume a worker exists): a busy worker is still a worker, and it will drain
+    the queue. A quick, definitively empty reply means nothing is listening, so
+    callers fall back to synchronous ingestion.
+    """
+    now = time.monotonic()
+    cached = _worker_probe_cache.get("available_until", 0.0)
+    if cached > now:
+        return True
+
+    try:
+        from app.celery_app import celery_app
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Celery app unavailable: %s", exc)
+        return False
+
+    outcome: list[bool | None] = [None]
+
+    def _probe() -> None:
+        try:
+            outcome[0] = bool(celery_app.control.ping(timeout=timeout))
+        except Exception as exc:  # noqa: BLE001 — broker unreachable, etc.
+            logger.warning("Celery worker ping failed: %s", exc)
+            outcome[0] = False
+
+    thread = threading.Thread(target=_probe, daemon=True, name="celery-ping")
+    thread.start()
+    # Allow the ping timeout plus a small scheduling margin.
+    thread.join(timeout + 0.5)
+
+    if outcome[0] is None:
+        # Still waiting on a busy worker — don't block the request.
+        logger.info("Celery ping timed out (worker busy?); enqueuing anyway.")
+        return True
+
+    if outcome[0]:
+        _worker_probe_cache["available_until"] = time.monotonic() + _WORKER_PROBE_TTL
+    return outcome[0]
+
+
+def _try_enqueue_ingest(
+    document_id: str, source_path: str, title: str, job_id: str
+) -> bool:
+    """Enqueue ingestion on a *live* Celery worker, else return False.
+
+    Returns False when no worker is consuming the ``ingestion`` queue (or the
+    broker is unreachable) so callers fall back to synchronous ingestion. That
+    keeps uploads working with just ``docker compose up`` and no worker
+    running, and stops jobs from silently stalling in Redis forever.
+    """
+    if not _celery_worker_available():
+        logger.info(
+            "No Celery worker is consuming the ingestion queue; "
+            "ingesting synchronously instead."
+        )
+        return False
+    try:
+        from app.tasks.ingestion import ingest_document_job
+
+        ingest_document_job.delay(document_id, source_path, title, job_id)
+        return True
+    except Exception as exc:  # noqa: BLE001 — broker down, old pickle, etc.
+        logger.warning("Celery enqueue failed, falling back to sync: %s", exc)
+        return False
+
+
 def _create_job_record(
     session,
     document_id: str,
@@ -135,7 +273,7 @@ def _create_job_record(
         415: {"model": ErrorResponse, "description": "Unsupported file type"},
     },
 )
-async def upload_document(
+def upload_document(
     response: Response,
     file: UploadFile = File(..., description="Document file to ingest"),  # noqa: B008
 ) -> DocumentUploadResponse:
@@ -146,20 +284,17 @@ async def upload_document(
     """
     _validate_upload(file)
 
-    # Save to temp directory
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        file_path = _save_upload_file(file, tmp_dir)
-        document_id = _doc_id_from_path(file_path)
-
-    # Get file size
-    file_size = file.size
+    # Persist the upload so a later /ingest call can still read the file.
+    file_path, _content_hash = _persist_upload(file)
+    document_id = _doc_id_from_path(file_path)
 
     # Create DB record
     session = SessionLocal()
     try:
         doc = _create_document_record(
-            session, document_id, file.filename or "unknown", file_path, file_size
+            session, document_id, file.filename or "unknown", file_path, file.size
         )
+        title = doc.title
         session.commit()
     finally:
         session.close()
@@ -168,9 +303,91 @@ async def upload_document(
 
     return DocumentUploadResponse(
         document_id=document_id,
-        title=doc.title,
+        title=title,
         status=DocumentStatus.PENDING,
         message="Document registered. Call POST /documents/{document_id}/ingest to start processing.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /documents/upload — upload + ingest in one call
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/upload",
+    response_model=DocumentUploadResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses={
+        413: {"model": ErrorResponse, "description": "File too large"},
+        415: {"model": ErrorResponse, "description": "Unsupported file type"},
+        500: {"model": ErrorResponse, "description": "Ingestion failed"},
+    },
+)
+# Sync endpoint: ingestion is blocking (parsing + CPU-bound embedding +
+# synchronous calls to Qdrant/Postgres). Running it on the event loop would
+# freeze the server for the whole ingest (~30s on a cold embedding model). A
+# sync endpoint runs in FastAPI's worker threadpool instead.
+def upload_and_ingest(
+    file: UploadFile = File(..., description="Document file to ingest"),  # noqa: B008
+    background: bool = Query(default=False),
+) -> DocumentUploadResponse:
+    """Upload a document and ingest it.
+
+    Default is synchronous (blocking, returns when indexed). Pass
+    ``?background=true`` to enqueue on the Celery/Redis worker and return
+    201 immediately with status=processing — follow
+    ``GET /documents/{id}/jobs/{job_id}/stream`` for progress.
+    """
+    _validate_upload(file)
+
+    file_path, _content_hash = _persist_upload(file)
+    document_id = _doc_id_from_path(file_path)
+    title = file.filename or Path(file_path).stem
+
+    session = SessionLocal()
+    try:
+        _create_document_record(session, document_id, title, file_path, file.size)
+        job = _create_job_record(session, document_id, str(uuid.uuid4()))
+        job_id = job.id
+        session.commit()
+    finally:
+        session.close()
+
+    if background and _try_enqueue_ingest(document_id, file_path, title, job_id):
+        return DocumentUploadResponse(
+            document_id=document_id,
+            title=title,
+            status=DocumentStatus.PROCESSING,
+            chunk_count=None,
+            message=(
+                f"Ingestion queued as job {job_id}. Stream progress at "
+                f"/documents/{document_id}/jobs/{job_id}/stream."
+            ),
+        )
+
+    try:
+        result = IngestionPipeline().ingest(file_path=file_path, title=title)
+    except Exception as exc:
+        _finish_job(document_id, job_id, status_=JobStatus.FAILED, error=str(exc))
+        logger.exception("Ingestion failed for %s", file_path)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "code": "INGESTION_FAILED",
+                "message": f"Ingestion failed: {exc}",
+                "request_id": document_id,
+            },
+        ) from exc
+
+    return DocumentUploadResponse(
+        document_id=result.document_id,
+        title=result.title,
+        status=DocumentStatus.READY,
+        chunk_count=result.chunk_count,
+        message=(
+            f"Ingested {result.chunk_count} chunks. Query it with "
+            f'document_ids=["{result.document_id}"].'
+        ),
     )
 
 
@@ -179,7 +396,8 @@ async def upload_document(
 # ---------------------------------------------------------------------------
 
 @router.get("", response_model=DocumentListResponse)
-async def list_documents() -> DocumentListResponse:
+# Sync endpoint: performs blocking SQLAlchemy queries.
+def list_documents() -> DocumentListResponse:
     """Return all registered documents and their processing status."""
     session = SessionLocal()
     try:
@@ -233,7 +451,8 @@ def _infer_status(doc: Document) -> DocumentStatus:
 # ---------------------------------------------------------------------------
 
 @router.get("/{document_id}", response_model=DocumentMetadata)
-async def get_document(document_id: str) -> DocumentMetadata:
+# Sync endpoint: performs blocking SQLAlchemy queries.
+def get_document(document_id: str) -> DocumentMetadata:
     """Return metadata for a specific document."""
     session = SessionLocal()
     try:
@@ -285,12 +504,19 @@ def _get_chunk_count(session, document_id: str) -> int:
     status_code=status.HTTP_202_ACCEPTED,
     responses={404: {"model": ErrorResponse, "description": "Document not found"}},
 )
-async def ingest_document(document_id: str) -> IngestionJobResponse:
-    """Trigger synchronous ingestion of a registered document.
+# Sync endpoint: runs the same blocking ingestion path as /upload.
+# Pass ?background=true to enqueue on the Celery worker (Redis) and return
+# 202 immediately — the UI can then follow progress via the SSE stream below.
+def ingest_document(
+    document_id: str, background: bool = Query(default=False)
+) -> IngestionJobResponse:
+    """Trigger ingestion of a registered document.
 
-    The document is parsed, chunked, and indexed into the vector store (Qdrant)
-    and BM25 index (OpenSearch). This is a blocking call — it returns when
-    ingestion is complete or has failed.
+    Default is synchronous (blocking, returns when complete). Pass
+    ``?background=true`` to enqueue on the Celery/Redis worker and return
+    202 immediately with status=running — poll
+    ``GET /documents/{id}/jobs`` or stream
+    ``GET /documents/{id}/jobs/{job_id}/stream`` for progress.
     """
     session = SessionLocal()
     try:
@@ -307,18 +533,35 @@ async def ingest_document(document_id: str) -> IngestionJobResponse:
                 },
             )
 
+        # Capture values before the session closes: `commit` expires the
+        # instance, so its attributes become unreadable once detached.
+        source_path = doc.source
+        doc_title = doc.title
+
         # Create a job record
-        import uuid
-        job_id = str(uuid.uuid4())
-        job = _create_job_record(session, document_id, job_id)
+        job = _create_job_record(session, document_id, str(uuid.uuid4()))
+        job_id = job.id
+        started_at = job.started_at or datetime.utcnow()
         session.commit()
     finally:
         session.close()
 
+    if background and _try_enqueue_ingest(document_id, source_path, doc_title, job_id):
+        # Async path: worker owns the job now; return immediately.
+        return IngestionJobResponse(
+            job_id=job_id,
+            document_id=document_id,
+            status=JobStatus.RUNNING,
+            chunk_count=None,
+            error=None,
+            started_at=started_at,
+            finished_at=None,
+        )
+
     # Run ingestion synchronously in the endpoint (blocking)
     pipeline = IngestionPipeline()
     try:
-        result = pipeline.ingest(file_path=doc.source, title=doc.title)
+        result = pipeline.ingest(file_path=source_path, title=doc_title)
         # Update job as success
         _finish_job(document_id, job_id, status_=JobStatus.SUCCESS, chunk_count=result.chunk_count)
         return IngestionJobResponse(
@@ -327,7 +570,7 @@ async def ingest_document(document_id: str) -> IngestionJobResponse:
             status=JobStatus.SUCCESS,
             chunk_count=result.chunk_count,
             error=None,
-            started_at=job.started_at or datetime.utcnow(),
+            started_at=started_at,
             finished_at=datetime.utcnow(),
         )
     except Exception as exc:
@@ -377,8 +620,9 @@ def _finish_job(
 # GET /documents/{document_id}/jobs — list jobs
 # ---------------------------------------------------------------------------
 
+# Sync endpoint: performs blocking SQLAlchemy queries.
 @router.get("/{document_id}/jobs", response_model=JobListResponse)
-async def list_ingestion_jobs(document_id: str) -> JobListResponse:
+def list_ingestion_jobs(document_id: str) -> JobListResponse:
     """Return all ingestion jobs for a document, newest first."""
     session = SessionLocal()
     try:
@@ -410,13 +654,58 @@ async def list_ingestion_jobs(document_id: str) -> JobListResponse:
 
 
 # ---------------------------------------------------------------------------
-# shim for shutil.copyfileobj (not available in all environments)
+# GET /documents/{document_id}/jobs/{job_id}/stream — SSE job progress
 # ---------------------------------------------------------------------------
 
-def shutil_copyfileobj(src, dst, length: int = 16384) -> None:
-    """Copy *src* file object to *dst* in chunks."""
-    while True:
-        chunk = src.read(length)
-        if not chunk:
-            break
-        dst.write(chunk)
+
+@router.get("/{document_id}/jobs/{job_id}/stream")
+def stream_ingestion_job(document_id: str, job_id: str) -> StreamingResponse:
+    """Stream ingestion progress as Server-Sent Events.
+
+    Emits ``event: progress`` every second with the job row, then
+    ``event: done`` once it reaches success/failed (or after ~120s timeout).
+    The browser stops spinning immediately and follows real progress instead
+    of blocking on the 20-60s cold embed.
+    """
+    import asyncio
+    import json
+
+    async def _events():
+        for _ in range(120):
+            session = SessionLocal()
+            try:
+                job = session.execute(
+                    select(IngestionJob).where(
+                        IngestionJob.id == job_id,
+                        IngestionJob.document_id == document_id,
+                    )
+                ).scalar_one_or_none()
+                if job is None:
+                    yield "event: error\ndata: "
+                    yield json.dumps({"code": "JOB_NOT_FOUND"})
+                    yield "\n\n"
+                    return
+                payload = json.dumps(
+                    {
+                        "job_id": job.id,
+                        "document_id": job.document_id,
+                        "status": job.status,
+                        "chunk_count": job.chunk_count,
+                        "error": job.error,
+                    }
+                )
+                if job.status in (
+                    JobStatus.SUCCESS.value,
+                    JobStatus.FAILED.value,
+                    "success",
+                    "failed",
+                ):
+                    yield f"event: done\ndata: {payload}\n\n"
+                    return
+                yield f"event: progress\ndata: {payload}\n\n"
+            finally:
+                session.close()
+            await asyncio.sleep(1)
+        yield 'event: timeout\ndata: {"code": "STREAM_TIMEOUT"}\n\n'
+
+    return StreamingResponse(_events(), media_type="text/event-stream")

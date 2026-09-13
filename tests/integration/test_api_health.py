@@ -1,7 +1,7 @@
 """Integration tests for health and readiness endpoints.
 
-All dependency checks (PostgreSQL, Qdrant, OpenSearch) are mocked so the
-tests run deterministically without requiring live Docker services.
+All dependency checks (PostgreSQL, Qdrant, keyword search, Redis, Celery)
+are mocked so the tests run deterministically without live Docker services.
 """
 
 from __future__ import annotations
@@ -49,27 +49,43 @@ class TestHealthEndpoint:
         assert response.status_code == 200
 
 class TestReadinessEndpoint:
+    @pytest.fixture(autouse=True)
+    def _mock_aux_checks(self):
+        """Redis/Celery are informational (sync fallback exists): healthy by
+        default so each test only declares its gated dependencies."""
+        with (
+            patch(
+                "app.api.routes.health._check_redis",
+                return_value=_healthy_dep("redis"),
+            ),
+            patch(
+                "app.api.routes.health._check_celery",
+                return_value=_healthy_dep("celery"),
+            ),
+        ):
+            yield
+
     @patch("app.api.routes.health._check_postgres")
     @patch("app.api.routes.health._check_qdrant")
-    @patch("app.api.routes.health._check_opensearch")
+    @patch("app.api.routes.health._check_keyword_search")
     def test_ready_returns_200(
-        self, mock_os, mock_qdrant, mock_pg, client: TestClient
+        self, mock_kw, mock_qdrant, mock_pg, client: TestClient
     ) -> None:
         mock_pg.return_value = _healthy_dep("postgresql")
         mock_qdrant.return_value = _healthy_dep("qdrant")
-        mock_os.return_value = _healthy_dep("opensearch")
+        mock_kw.return_value = _healthy_dep("keyword")
         response = client.get("/ready")
         assert response.status_code == 200
 
     @patch("app.api.routes.health._check_postgres")
     @patch("app.api.routes.health._check_qdrant")
-    @patch("app.api.routes.health._check_opensearch")
+    @patch("app.api.routes.health._check_keyword_search")
     def test_ready_returns_readiness_status(
-        self, mock_os, mock_qdrant, mock_pg, client: TestClient
+        self, mock_kw, mock_qdrant, mock_pg, client: TestClient
     ) -> None:
         mock_pg.return_value = _healthy_dep("postgresql")
         mock_qdrant.return_value = _healthy_dep("qdrant")
-        mock_os.return_value = _healthy_dep("opensearch")
+        mock_kw.return_value = _healthy_dep("keyword")
         response = client.get("/ready")
         data = response.json()
         assert "status" in data
@@ -78,52 +94,62 @@ class TestReadinessEndpoint:
 
     @patch("app.api.routes.health._check_postgres")
     @patch("app.api.routes.health._check_qdrant")
-    @patch("app.api.routes.health._check_opensearch")
+    @patch("app.api.routes.health._check_keyword_search")
     def test_ready_checks_all_dependencies(
-        self, mock_os, mock_qdrant, mock_pg, client: TestClient
+        self, mock_kw, mock_qdrant, mock_pg, client: TestClient
     ) -> None:
         mock_pg.return_value = _healthy_dep("postgresql")
         mock_qdrant.return_value = _healthy_dep("qdrant")
-        mock_os.return_value = _healthy_dep("opensearch")
+        mock_kw.return_value = _healthy_dep("keyword")
         response = client.get("/ready")
         deps = response.json()["dependencies"]
         names = {d["name"] for d in deps}
-        assert names == {"postgresql", "qdrant", "opensearch"}
+        assert names == {"postgresql", "qdrant", "keyword", "redis", "celery"}
 
     @patch("app.api.routes.health._check_postgres")
     @patch("app.api.routes.health._check_qdrant")
-    @patch("app.api.routes.health._check_opensearch")
+    @patch("app.api.routes.health._check_keyword_search")
     def test_ready_all_healthy(
-        self, mock_os, mock_qdrant, mock_pg, client: TestClient
+        self, mock_kw, mock_qdrant, mock_pg, client: TestClient
     ) -> None:
         mock_pg.return_value = _healthy_dep("postgresql")
         mock_qdrant.return_value = _healthy_dep("qdrant")
-        mock_os.return_value = _healthy_dep("opensearch")
+        mock_kw.return_value = _healthy_dep("keyword")
         response = client.get("/ready")
         assert response.json()["status"] == "healthy"
 
     @patch("app.api.routes.health._check_postgres")
     @patch("app.api.routes.health._check_qdrant")
-    @patch("app.api.routes.health._check_opensearch")
+    @patch("app.api.routes.health._check_keyword_search")
     def test_ready_any_unhealthy_is_unhealthy(
-        self, mock_os, mock_qdrant, mock_pg, client: TestClient
+        self, mock_kw, mock_qdrant, mock_pg, client: TestClient
     ) -> None:
         mock_pg.return_value = _healthy_dep("postgresql")
         mock_qdrant.return_value = _unhealthy_dep("qdrant", "connection refused")
-        mock_os.return_value = _healthy_dep("opensearch")
+        mock_kw.return_value = _healthy_dep("keyword")
         response = client.get("/ready")
         assert response.json()["status"] == "unhealthy"
 
     @patch("app.api.routes.health._check_postgres")
     @patch("app.api.routes.health._check_qdrant")
-    @patch("app.api.routes.health._check_opensearch")
+    @patch("app.api.routes.health._check_keyword_search")
     def test_ready_error_is_safe_and_non_empty(
-        self, mock_os, mock_qdrant, mock_pg, client: TestClient
+        self, mock_kw, mock_qdrant, mock_pg, client: TestClient
     ) -> None:
         mock_pg.return_value = _unhealthy_dep("postgresql", "connection refused")
         mock_qdrant.return_value = _unhealthy_dep("qdrant", "timeout")
-        mock_os.return_value = _unhealthy_dep("opensearch", "cluster red")
-        response = client.get("/ready")
+        mock_kw.return_value = _unhealthy_dep("keyword", "tsvector missing")
+        with (
+            patch(
+                "app.api.routes.health._check_redis",
+                return_value=_unhealthy_dep("redis", "broker down"),
+            ),
+            patch(
+                "app.api.routes.health._check_celery",
+                return_value=_unhealthy_dep("celery", "no workers"),
+            ),
+        ):
+            response = client.get("/ready")
         data = response.json()
         for dep in data["dependencies"]:
             assert dep["status"] == "unhealthy"

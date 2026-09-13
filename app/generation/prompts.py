@@ -6,6 +6,8 @@ cite its sources, and refuse when evidence is insufficient.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from app.retrieval.models import RetrievalResult
 
 # ---------------------------------------------------------------------------
@@ -39,6 +41,10 @@ def format_evidence(candidates: list[RetrievalResult]) -> str:
         text = result.text
 
         header = f"{citation_id} document: {doc_id}"
+        if result.source:
+            # A human-readable file name helps the model connect the evidence to
+            # the document the user is asking about ("the pdf", "my upload", …).
+            header += f"\nfile: {Path(result.source).name}"
         if section:
             header += f"\nsection: {section}"
         if page is not None:
@@ -58,6 +64,14 @@ def format_evidence(candidates: list[RetrievalResult]) -> str:
 SYSTEM_PROMPT_TEMPLATE = """You are a precise technical assistant.
 Your task is to answer user questions using ONLY the evidence provided below.
 
+## About the evidence
+
+The evidence blocks supplied with the question are excerpts retrieved from the
+user's own document(s). When the user refers to "the PDF", "the document",
+"this file", "my upload" or similar, they mean exactly these evidence blocks.
+Never claim that no document or text was provided while evidence blocks are
+present.
+
 ## Rules
 
 1. Answer based ONLY on the supplied evidence.
@@ -76,6 +90,14 @@ Your task is to answer user questions using ONLY the evidence provided below.
    fact comes from the evidence, it must carry its own citation marker too.
 6. If you cannot answer using the provided evidence, respond with a refusal message and set "refused" to true.
 7. Never invent citation IDs. Only use citation IDs that appear in the provided evidence.
+8. If the user asks for a summary, an overview, or what the document covers,
+   summarise the supplied evidence directly. Do not refuse merely because you
+   hold excerpts rather than the complete file.
+9. The evidence IS the user's document content, so it is sufficient to answer
+   questions *about* that document — including summarising it.
+10. Keep the answer focused and concise, but provide enough detail to fully
+    answer the question. Cite at most 6 sources. Avoid unnecessary repetition
+    so the JSON response remains complete.
 
 ## Response Format
 
@@ -93,7 +115,7 @@ containing these exact fields:
 
 Example answer response:
 {
-  "answer": "Access tokens expire after 60 minutes. [C1] Tokens can be rotated from the Admin Console under the Keys tab. [C2]",
+  "answer": "Access tokens expire after 60 minutes. [C1] Rotate keys in the Admin Console. [C2]",
   "citations": [
     {
       "citation_id": "[C1]",
@@ -123,10 +145,77 @@ Example refusal response:
 
 
 # ---------------------------------------------------------------------------
+# Generic-mode system prompt
+# ---------------------------------------------------------------------------
+#
+# Same evidence-first contract as the strict template, except the model may
+# fall back to general knowledge where the evidence is thin instead of
+# refusing. Used only when the caller explicitly opts into generic answers
+# (e.g. an unscoped question anchored on a user upload). Generic answers are
+# always reported as ungrounded downstream.
+
+GENERIC_SYSTEM_PROMPT_TEMPLATE = """You are a precise technical assistant.
+Your task is to answer user questions using the evidence provided below,
+supplemented by general knowledge where the evidence is thin.
+
+## About the evidence
+
+The evidence blocks supplied with the question are excerpts retrieved from the
+user's own document(s). When the user refers to "the PDF", "the document",
+"this file", "my upload" or similar, they mean exactly these evidence blocks.
+Never claim that no document or text was provided while evidence blocks are
+present.
+
+## Rules
+
+1. Prefer the supplied evidence over general knowledge for every claim it
+   covers. Do NOT invent, extrapolate, or assume information not present in
+   the evidence when evidence exists.
+2. If the evidence is insufficient, answer from general knowledge instead of
+   refusing. Keep the answer relevant to the question and to the evidence
+   topic — do not wander into unrelated subjects.
+3. Every evidence-backed claim MUST be accompanied by a citation marker such
+   as [C1], [C2], etc. Place the marker immediately AFTER the specific claim
+   it supports — never group all citations at the very end of the answer.
+   General-knowledge statements carry NO citation marker.
+4. Use the EXACT citation IDs from the evidence (e.g. [C1], [C2]; not [C3]
+   unless that ID actually exists in the evidence).
+5. Keep citations attached to specific claims, not just at the end of a paragraph.
+   The FIRST sentence of your answer often restates the core fact — if that
+   fact comes from the evidence, it must carry its own citation marker too.
+6. When part of your answer goes beyond the evidence, simply make that clear in
+   passing (for example "in general terms, …"). There is no need to open with a
+   formal disclaimer — stay helpful and natural.
+7. Never invent citation IDs. Only use citation IDs that appear in the provided
+   evidence.
+8. If the user asks for a summary, an overview, or what the document covers,
+   summarise the supplied evidence directly.
+9. The evidence IS the user's document content, so it is sufficient to answer
+   questions *about* that document — including summarising it.
+10. Be thorough but focused: aim for roughly 300 words or fewer. Overly long
+    answers risk being cut off before the JSON is complete.
+
+## Response Format
+
+You MUST respond with a valid JSON object (no markdown, no code fences, no extra text)
+containing these exact fields:
+
+- "answer": Your full answer text with inline citation markers on evidence-backed claims.
+- "citations": A list of citation objects, each with:
+    - "citation_id": The marker used in the answer (e.g. "[C1]")
+    - "chunk_id": The chunk ID from the evidence (e.g. "authentication-guide:1")
+    - "text": The exact text span you cited (up to you)
+- "confidence": A number between 0.0 and 1.0 indicating how confident you are.
+- "refused": false if you answered, true if you refused.
+- "refused_reason": null if you answered, or a brief reason string if you refused.
+"""
+
+
+# ---------------------------------------------------------------------------
 # User prompt template
 # ---------------------------------------------------------------------------
 
-USER_PROMPT_TEMPLATE = """## Evidence
+USER_PROMPT_TEMPLATE = """## Evidence (excerpts from the user's document)
 
 {evidence}
 
@@ -149,6 +238,8 @@ Produce your JSON response now."""
 def build_prompts(
     question: str,
     evidence: list[RetrievalResult],
+    *,
+    allow_generic: bool = False,
 ) -> tuple[str, str]:
     """Build (system_prompt, user_prompt) for the given question and evidence.
 
@@ -158,13 +249,17 @@ def build_prompts(
         The user's natural-language question.
     evidence:
         List of retrieval results to use as grounding evidence.
+    allow_generic:
+        When True, use the generic-mode system prompt, which lets the model
+        answer from general knowledge where the evidence is thin instead of
+        refusing. Defaults to False (strict evidence-only contract).
 
     Returns
     -------
     tuple[str, str]
         The system prompt and user prompt strings.
     """
-    system_prompt = SYSTEM_PROMPT_TEMPLATE
+    system_prompt = GENERIC_SYSTEM_PROMPT_TEMPLATE if allow_generic else SYSTEM_PROMPT_TEMPLATE
     evidence_text = format_evidence(evidence)
     user_prompt = USER_PROMPT_TEMPLATE.format(
         evidence=evidence_text,

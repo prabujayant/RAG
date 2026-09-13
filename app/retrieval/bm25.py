@@ -1,12 +1,22 @@
-"""OpenSearch BM25 full-text search wrapper."""
+"""Postgres tsvector keyword search (BM25-side of hybrid retrieval).
+
+Same public interface as the vector store, so no caller changes: hybrid
+fusion, the ingestion pipeline, and the evaluation runner all keep working.
+Ranking uses ``ts_rank_cd`` over a weighted ``tsv`` (chunk text weight A,
+section weight B, english config).
+
+Postings live in their own ``keyword_postings`` table — not as a column on
+``chunks`` — so posting lifecycle (index / delete / count) stays independent
+of chunk rows.
+"""
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
+from threading import Lock
 
-from opensearchpy import OpenSearch
-from opensearchpy.exceptions import NotFoundError
+from sqlalchemy import text
 
 from app.config import get_settings
 from app.config.settings import Settings
@@ -14,199 +24,240 @@ from app.ingestion.chunker import Chunk
 
 logger = logging.getLogger(__name__)
 
+# DDL for the tsvector column, trigger, and GIN index. Runs idempotently via
+# ensure_index(), scripts/migrate_tsvector.py (existing DBs + backfill), and
+# scripts/init_db.py. The ORM model (KeywordPosting) intentionally does NOT
+# map ``tsv`` — the trigger owns it on every insert/update.
+KEYWORD_DDL = [
+    "ALTER TABLE keyword_postings ADD COLUMN IF NOT EXISTS tsv tsvector",
+    """CREATE OR REPLACE FUNCTION keyword_postings_tsv_trigger() RETURNS trigger AS $$
+BEGIN
+  NEW.tsv :=
+    setweight(to_tsvector('pg_catalog.english', coalesce(NEW.text, '')), 'A') ||
+    setweight(to_tsvector('pg_catalog.english', coalesce(NEW.section, '')), 'B');
+  RETURN NEW;
+END
+$$ LANGUAGE plpgsql""",
+    """DROP TRIGGER IF EXISTS keyword_postings_tsv_update ON keyword_postings""",
+    """CREATE TRIGGER keyword_postings_tsv_update
+BEFORE INSERT OR UPDATE OF text, section ON keyword_postings
+FOR EACH ROW EXECUTE FUNCTION keyword_postings_tsv_trigger()""",
+    "CREATE INDEX IF NOT EXISTS keyword_postings_tsv_gin ON keyword_postings USING GIN (tsv)",
+]
 
-def _chunk_payload(chunk: Chunk) -> dict:
-    """Build the OpenSearch document for a single chunk."""
-    return {
-        "chunk_id": chunk.chunk_id,
-        "document_id": chunk.document_id,
-        "document_name": chunk.document_name,
-        "text": chunk.text,
-        "source": chunk.source,
-        "page_number": chunk.page_number,
-        "section": chunk.section,
-        "content_hash": chunk.content_hash,
-    }
+_ENSURED_KEY = "keyword_postings"
+_ENSURED: set[str] = set()
+_ENSURED_LOCK = Lock()
+
+
+def _session_factory_from_settings() -> object:
+    """Return the process SessionLocal (imported lazily to avoid cycles)."""
+    from app.db.session import SessionLocal
+
+    return SessionLocal
 
 
 class BM25Indexer:
-    """OpenSearch-backed BM25 indexer.
+    """Postgres-backed keyword indexer (index / delete / search / count).
 
     Parameters
     ----------
     settings:
-        Application settings containing OPENSEARCH_URL, OPENSEARCH_USERNAME,
-        OPENSEARCH_PASSWORD, OPENSEARCH_INDEX.
-    client:
-        Optional OpenSearch client (allows injection in tests).
+        Application settings (currently unused beyond compat; kept so all
+        existing constructors ``BM25Indexer(settings)`` keep working).
+    session_factory:
+        Callable returning a context-managed SQLAlchemy session
+        (``with factory() as session: ...``). Defaults to ``SessionLocal``.
+        Inject a fake in unit tests.
     """
 
     def __init__(
         self,
         settings: Settings | None = None,
-        client: OpenSearch | None = None,
+        session_factory: object | None = None,
     ) -> None:
-        s = settings or get_settings()
-        self.index = s.opensearch_index
-        self._client = client or OpenSearch(
-            [s.opensearch_url],
-            basic_auth=(s.opensearch_username, s.opensearch_password),
-            verify_certs=False,
-            timeout=30,
-        )
+        self._settings = settings or get_settings()
+        self._sessions = session_factory or _session_factory_from_settings()
+
+    # ------------------------------------------------------------------ ddl
 
     def ensure_index(self) -> None:
-        """Create the BM25 index with standard analyzer if it does not exist."""
-        if self._client.indices.exists(index=self.index):
-            logger.info("OpenSearch index %s already exists", self.index)
-            return
-        body = {
-            "settings": {
-                "index": {
-                    "number_of_shards": 1,
-                    "number_of_replicas": 0,
-                },
-                "analysis": {
-                    "analyzer": {
-                        "default": {
-                            "type": "standard",
-                        }
-                    }
-                },
-            },
-            "mappings": {
-                "properties": {
-                    "chunk_id": {"type": "keyword"},
-                    "document_id": {"type": "keyword"},
-                    "document_name": {"type": "text"},
-                    "text": {"type": "text"},
-                    "source": {"type": "keyword"},
-                    "page_number": {"type": "integer"},
-                    "section": {"type": "text"},
-                    "content_hash": {"type": "keyword"},
-                }
-            },
-        }
-        self._client.indices.create(index=self.index, body=body)
-        logger.info("Created OpenSearch index %s", self.index)
+        """Create the tsv column, trigger, and GIN index if missing.
 
-    def index_documents(self, chunks: list[Chunk]) -> None:
-        """Bulk-index a list of chunks into OpenSearch (idempotent on chunk_id)."""
+        Idempotent and memoized per process. Safe to call on every search.
+        """
+        with _ENSURED_LOCK:
+            if _ENSURED_KEY in _ENSURED:
+                return
+        with self._sessions() as session:  # type: ignore[operator]
+            for stmt in KEYWORD_DDL:
+                session.execute(text(stmt))
+            session.commit()
+        with _ENSURED_LOCK:
+            _ENSURED.add(_ENSURED_KEY)
+        logger.debug("Keyword postings tsvector objects ensured")
+
+    # ----------------------------------------------------------------- write
+
+    def index_documents(self, chunks: list[Chunk], refresh: bool = True) -> None:  # noqa: ARG002
+        """Upsert keyword postings for *chunks* (idempotent on chunk_id).
+
+        ``refresh`` is accepted for interface compatibility and ignored:
+        Postgres postings are visible on commit — there is no segment-refresh
+        step anymore (that per-document refresh was the old bulk-ingest tax).
+        """
         if not chunks:
             return
         self.ensure_index()
-        bulk_body: list[dict] = []
-        for chunk in chunks:
-            bulk_body.append({"index": {"_index": self.index, "_id": chunk.chunk_id}})
-            bulk_body.append(_chunk_payload(chunk))
-        self._client.bulk(body=bulk_body, refresh=True)
-        logger.info("BM25-indexed %d chunks to OpenSearch", len(chunks))
+        from app.db.models import KeywordPosting
+
+        with self._sessions() as session:  # type: ignore[operator]
+            for chunk in chunks:
+                posting = KeywordPosting(
+                    chunk_id=chunk.chunk_id,
+                    document_id=chunk.document_id,
+                    text=chunk.text,
+                    source=chunk.source,
+                    page_number=chunk.page_number,
+                    section=chunk.section,
+                )
+                session.merge(posting)
+            session.commit()
+        logger.info("Keyword-indexed %d chunks (tsvector)", len(chunks))
 
     def upsert(self, chunks: Iterable[Chunk]) -> int:
-        """Alias for :meth:`index_documents` (parity with :class:`VectorStore`).
-
-        Returns the number of chunks indexed.
-        """
+        """Alias for :meth:`index_documents` (parity with VectorStore)."""
         chunk_list = list(chunks)
         self.index_documents(chunk_list)
         return len(chunk_list)
 
-    def get(self, chunk_id: str) -> dict | None:
-        """Return the indexed document for a single chunk, or None if missing."""
-        try:
-            resp = self._client.get(index=self.index, id=chunk_id)
-        except NotFoundError:
-            return None
-        return resp.get("_source")
-
-    def count(self, document_id: str | None = None) -> int:
-        """Count documents in the index, optionally filtered by document_id."""
-        body: dict = {"query": {"match_all": {}}} if document_id is None else {
-            "query": {"term": {"document_id": document_id}}
-        }
-        try:
-            resp = self._client.count(index=self.index, body=body)
-        except NotFoundError:
-            return 0
-        return int(resp.get("count", 0))
-
-    def delete_by_document(self, document_id: str, refresh: bool = True) -> int:
-        """Delete all chunks of a single document. Returns the number deleted."""
-        try:
-            resp = self._client.delete_by_query(
-                index=self.index,
-                body={"query": {"term": {"document_id": document_id}}},
-                refresh=refresh,
-                conflicts="proceed",
-            )
-        except NotFoundError:
-            return 0
-        return int(resp.get("deleted", 0))
-
-    def delete_by_ids(self, chunk_ids: Iterable[str], refresh: bool = True) -> int:
-        """Delete specific chunks by chunk_id. Returns the number deleted."""
-        ids = list(chunk_ids)
-        if not ids:
-            return 0
-        body: list[dict] = []
-        for cid in ids:
-            body.append({"delete": {"_index": self.index, "_id": cid}})
-        resp = self._client.bulk(body=body, refresh=refresh)
-        if not resp.get("errors"):
-            return len(ids)
-        # Count successful deletes when some failed.
-        return sum(
-            1
-            for item in resp.get("items", [])
-            if item.get("delete", {}).get("status", 500) < 300
-        )
-
-    def delete_index(self) -> None:
-        """Drop the entire index (idempotent)."""
-        try:
-            self._client.indices.delete(index=self.index)
-        except NotFoundError:
-            return
-        logger.info("Deleted OpenSearch index %s", self.index)
+    # ------------------------------------------------------------------ read
 
     def search(
         self,
         query: str,
         top_k: int = 20,
         filter_document_ids: list[str] | None = None,
-        fields: list[str] | None = None,
+        exclude_document_ids: list[str] | None = None,
+        fields: list[str] | None = None,  # noqa: ARG002
     ) -> list[dict]:
-        """Search for the top-k chunks matching the query.
+        """Search postings with ``ts_rank_cd``.
 
-        Parameters
-        ----------
-        query:
-            Free-text query string.
-        top_k:
-            Number of results to return.
-        filter_document_ids:
-            Optional document_id filter.
-        fields:
-            Fields searched by ``multi_match``. Defaults to ``["text"]``;
-            pass e.g. ``["text", "section"]`` to expand recall.
-
-        Returns
-        -------
-        list[dict]
-            Each dict has ``id``, ``score``, and ``payload`` (chunk fields).
+        ``fields`` is accepted for interface compatibility and ignored: the
+        ``tsv`` always covers text (weight A) + section (weight B).
+        Returns dicts with ``id``, ``score``, ``payload`` like before.
         """
+        if not query or not query.strip():
+            return []
         self.ensure_index()
-        search_fields = fields or ["text"]
-        must_clause: list[dict] = [{"multi_match": {"query": query, "fields": search_fields}}]
-        filter_clause: list[dict] = (
-            [{"terms": {"document_id": filter_document_ids}}] if filter_document_ids else []
+        # OR semantics for natural-language questions: websearch_to_tsquery
+        # ANDs unquoted terms ('a & b'), which returns near-empty results.
+        # Rewriting '&' to '|' keeps PG stemming while scoring any-term
+        # matches. nullif guards stopword-only queries (empty tsquery would
+        # be a syntax error; NULL matches nothing instead).
+        tsquery = (
+            "to_tsquery('english', nullif(replace("
+            "websearch_to_tsquery('english', :q)::text, ' & ', ' | '), ''))"
         )
-        body = {
-            "query": {"bool": {"must": must_clause, "filter": filter_clause}},
-            "size": top_k,
-        }
-        resp = self._client.search(index=self.index, body=body)
-        hits = resp["hits"]["hits"]
+        clauses = [f"tsv @@ {tsquery}"]
+        params: dict = {"q": query, "k": top_k}
+        if filter_document_ids:
+            clauses.append("document_id = ANY(:f)")
+            params["f"] = list(filter_document_ids)
+        if exclude_document_ids:
+            clauses.append("NOT (document_id = ANY(:e))")
+            params["e"] = list(exclude_document_ids)
+        stmt = text(
+            "SELECT chunk_id, document_id, text, source, page_number, section,"
+            f" ts_rank_cd(tsv, {tsquery}) AS score"
+            " FROM keyword_postings"
+            f" WHERE {' AND '.join(clauses)}"
+            " ORDER BY score DESC LIMIT :k"
+        )
+        with self._sessions() as session:  # type: ignore[operator]
+            rows = session.execute(stmt, params).mappings().all()
         return [
-            {"id": h["_id"], "score": h["_score"], "payload": h["_source"]} for h in hits
+            {
+                "id": r["chunk_id"],
+                "score": float(r["score"]),
+                "payload": {
+                    "document_id": r["document_id"],
+                    "text": r["text"],
+                    "source": r["source"],
+                    "page_number": r["page_number"],
+                    "section": r["section"],
+                },
+            }
+            for r in rows
         ]
+
+    def get(self, chunk_id: str) -> dict | None:
+        """Return the posting for a single chunk, or None if missing."""
+        with self._sessions() as session:  # type: ignore[operator]
+            from app.db.models import KeywordPosting
+
+            row = session.get(KeywordPosting, chunk_id)
+            if row is None:
+                return None
+            return {
+                "chunk_id": row.chunk_id,
+                "document_id": row.document_id,
+                "text": row.text,
+                "source": row.source,
+                "page_number": row.page_number,
+                "section": row.section,
+            }
+
+    def count(self, document_id: str | None = None) -> int:
+        """Count postings, optionally filtered by document_id."""
+        with self._sessions() as session:  # type: ignore[operator]
+            from sqlalchemy import func, select
+
+            from app.db.models import KeywordPosting
+
+            q = select(func.count()).select_from(KeywordPosting)
+            if document_id is not None:
+                q = q.where(KeywordPosting.document_id == document_id)
+            return int(session.execute(q).scalar() or 0)
+
+    # ---------------------------------------------------------------- delete
+
+    def delete_by_document(self, document_id: str, refresh: bool = True) -> int:  # noqa: ARG002
+        """Delete all postings of one document. Returns the number deleted."""
+        from app.db.models import KeywordPosting
+
+        with self._sessions() as session:  # type: ignore[operator]
+            n = (
+                session.query(KeywordPosting)
+                .filter(KeywordPosting.document_id == document_id)
+                .delete(synchronize_session=False)
+            )
+            session.commit()
+            return int(n)
+
+    def delete_by_ids(self, chunk_ids: Iterable[str], refresh: bool = True) -> int:  # noqa: ARG002
+        """Delete specific postings by chunk_id. Returns the number deleted."""
+        from app.db.models import KeywordPosting
+
+        ids = list(chunk_ids)
+        if not ids:
+            return 0
+        with self._sessions() as session:  # type: ignore[operator]
+            n = (
+                session.query(KeywordPosting)
+                .filter(KeywordPosting.chunk_id.in_(ids))
+                .delete(synchronize_session=False)
+            )
+            session.commit()
+            return int(n)
+
+    def delete_index(self) -> None:
+        """Drop all postings (idempotent). The table and trigger stay."""
+        from app.db.models import KeywordPosting
+
+        with self._sessions() as session:  # type: ignore[operator]
+            session.query(KeywordPosting).delete(synchronize_session=False)
+            session.commit()
+        with _ENSURED_LOCK:
+            _ENSURED.discard(_ENSURED_KEY)
+        logger.info("Cleared keyword postings")

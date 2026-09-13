@@ -53,12 +53,16 @@ class DocumentListResponse(BaseModel):
 
 
 class DocumentUploadResponse(BaseModel):
-    """Response after a successful POST /documents."""
+    """Response after a successful POST /documents or POST /documents/upload."""
 
     document_id: str = Field(description="Stable document identifier")
     title: str = Field(description="Document title or file name")
-    status: DocumentStatus = Field(description="Initial processing status")
+    status: DocumentStatus = Field(description="Processing status")
     message: str = Field(description="Human-readable status message")
+    chunk_count: int | None = Field(
+        default=None,
+        description="Number of chunks indexed (only set once ingestion has run)",
+    )
 
 
 # ---------------------------------------------------------------------------

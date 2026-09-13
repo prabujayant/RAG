@@ -140,3 +140,24 @@ class TestPromptContentRequirements:
         assert "## Evidence" in USER_PROMPT_TEMPLATE
         assert "## Question" in USER_PROMPT_TEMPLATE
         assert "Produce your JSON response now." in USER_PROMPT_TEMPLATE
+
+class TestBuildPromptsGeneric:
+    """Tests for the generic-mode prompt variant."""
+
+    def test_strict_contract_forbids_invention(self) -> None:
+        """Default (strict) prompt tells the model to refuse, not invent."""
+        sys, _ = build_prompts("token lifetime?", [])
+        assert "Do NOT make up an answer" in sys
+
+    def test_generic_contract_permits_general_knowledge(self) -> None:
+        """Generic prompt allows general knowledge instead of refusal."""
+        sys, _ = build_prompts("token lifetime?", [], allow_generic=True)
+        assert "general knowledge" in sys
+        assert "Do NOT make up an answer" not in sys
+
+    def test_generic_prompt_keeps_json_contract(self) -> None:
+        """Generic prompt still demands the same JSON response format."""
+        sys, _ = build_prompts("token lifetime?", [], allow_generic=True)
+        assert '"answer"' in sys
+        assert '"citations"' in sys
+        assert '"refused"' in sys

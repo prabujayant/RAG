@@ -56,12 +56,16 @@ def _tokenize(text: str) -> set[str]:
 
 
 def _extract_numbers_and_codes(text: str) -> set[str]:
-    """Extract numeric and code-like identifiers (e.g. 60, AES-256, v2)."""
+    """Extract numeric and code-like identifiers (e.g. 60, AES-256, v2, amsk_)."""
     # Numbers
     numbers = set(re.findall(r"\b\d+(?:\.\d+)?\b", text))
-    # Alphanumeric codes like AES-256, v2.0, TLS-1.2
-    codes = set(re.findall(r"\b[A-Z][A-Z0-9]*(?:-\d+(?:\.\d+)?)+\b", text))
-    return numbers | codes
+    # Alphanumeric codes like AES-256, v2.0, TLS-1.2 (case-insensitive)
+    codes = set(
+        re.findall(r"\b[A-Z][A-Z0-9]*(?:-\d+(?:\.\d+)?)+\b", text, flags=re.IGNORECASE)
+    )
+    # Underscore identifiers like amsk_, err_429, api_key_v2
+    underscore_codes = set(re.findall(r"\b[a-z]+_[a-z0-9_]+\b", text.lower()))
+    return numbers | codes | underscore_codes
 
 
 def _has_negation(text: str) -> bool:
@@ -69,7 +73,7 @@ def _has_negation(text: str) -> bool:
     negation_patterns = [
         r"\bnot\b", r"\bno\b", r"\bnever\b", r"\bnone\b",
         r"\bneither\b", r"\bnobody\b", r"\bnothing\b",
-        r"\bdoesn't\b", r"\bdoesn't\b", r"\bdon't\b",
+        r"\bdoesn't\b", r"\bdon't\b",
         r"\bisn't\b", r"\baren't\b", r"\bwasn't\b", r"\bweren't\b",
         r"\bhasn't\b", r"\bhaven't\b", r"\bhadn't\b",
         r"\bwon't\b", r"\bwouldn't\b", r"\bcan't\b", r"\bcannot\b",

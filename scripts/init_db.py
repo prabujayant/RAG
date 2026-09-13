@@ -1,15 +1,16 @@
 """Initialize the AskMyDocs platform.
 
-Creates all PostgreSQL tables, bootstraps the Qdrant collection and the
-OpenSearch BM25 index, and ensures the evaluation output directories exist.
+Creates all PostgreSQL tables (including keyword postings), bootstraps the
+Qdrant collection and the keyword search objects, and ensures the
+evaluation output directories exist.
 
 Usage:
-    python scripts/init_db.py                # full bootstrap (PG + Qdrant + OpenSearch)
+    python scripts/init_db.py                # full bootstrap (PG + Qdrant + keyword)
     python scripts/init_db.py --no-vectors   # PG only (offline / unit-test setup)
 
 The default .env connects to the services started by
 `docker compose up -d`. Each step is independent — a failure in vector or
-BM25 bootstrap does not roll back the database schema.
+keyword bootstrap does not roll back the database schema.
 """
 
 from __future__ import annotations
@@ -32,13 +33,13 @@ def ensure_eval_dirs() -> None:
 
 
 def bootstrap_vectors() -> tuple[bool, bool]:
-    """Best-effort bootstrap of Qdrant + OpenSearch.
+    """Best-effort bootstrap of Qdrant + keyword search.
 
-    Returns ``(qdrant_ok, opensearch_ok)``. Failures are logged but do not
+    Returns ``(qdrant_ok, keyword_ok)``. Failures are logged but do not
     raise, so this script can run in environments where the vector stores
     are not yet up.
     """
-    qdrant_ok = opensearch_ok = False
+    qdrant_ok = keyword_ok = False
     try:
         from app.retrieval.vector import VectorStore
 
@@ -52,12 +53,12 @@ def bootstrap_vectors() -> tuple[bool, bool]:
         from app.retrieval.bm25 import BM25Indexer
 
         BM25Indexer().ensure_index()
-        opensearch_ok = True
-        print("OpenSearch BM25 index ready.")
+        keyword_ok = True
+        print("Keyword (tsvector) search ready.")
     except Exception as exc:  # noqa: BLE001
-        print(f"[warn] OpenSearch bootstrap skipped: {exc}")
+        print(f"[warn] Keyword bootstrap skipped: {exc}")
 
-    return qdrant_ok, opensearch_ok
+    return qdrant_ok, keyword_ok
 
 
 def main() -> int:
@@ -65,7 +66,7 @@ def main() -> int:
     parser.add_argument(
         "--no-vectors",
         action="store_true",
-        help="Only initialize PostgreSQL (skip Qdrant + OpenSearch).",
+        help="Only initialize PostgreSQL (skip Qdrant + keyword bootstrap).",
     )
     args = parser.parse_args()
 
@@ -79,10 +80,20 @@ def main() -> int:
         return 1
     print("Database schema initialized.")
 
+    # Keyword tsvector objects live outside the ORM mapping (trigger-owned),
+    # so create_all doesn't cover them — ensure here for fresh and old DBs.
+    try:
+        from app.retrieval.bm25 import BM25Indexer
+
+        BM25Indexer().ensure_index()
+        print("Keyword (tsvector) objects ensured.")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warn] Keyword DDL skipped: {exc}")
+
     if not args.no_vectors:
         bootstrap_vectors()
     else:
-        print("Skipping Qdrant + OpenSearch bootstrap (--no-vectors).")
+        print("Skipping Qdrant + keyword bootstrap (--no-vectors).")
 
     ensure_eval_dirs()
     print("Evaluation directories ensured.")

@@ -1,8 +1,8 @@
 """SQLAlchemy ORM models for AskMyDocs application metadata.
 
 PostgreSQL stores metadata only — documents, chunks (metadata, not
-embeddings), ingestion jobs, queries, and evaluation runs. Vector embeddings
-live in Qdrant; the BM25 index lives in OpenSearch.
+embeddings), keyword-search postings (tsvector), ingestion jobs, queries,
+and evaluation runs. Vector embeddings live in Qdrant.
 """
 
 from __future__ import annotations
@@ -113,3 +113,22 @@ class EvaluationRun(Base):
     metrics: Mapped[dict] = mapped_column(JSON, default=dict)
     passed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class KeywordPosting(Base):
+    """Keyword-search posting for one chunk (Postgres tsvector BM25).
+
+    One row per chunk, ``tsv`` maintained by a trigger (``text`` weight A,
+    ``section`` weight B). Ranked with ``ts_rank_cd``. Kept in its own
+    table — not a column on ``chunks`` — so posting lifecycle
+    (index/delete/count) stays independent of chunk rows.
+    """
+
+    __tablename__ = "keyword_postings"
+
+    chunk_id: Mapped[str] = mapped_column(String(64), primary_key=True)  # {doc_id}:{index}
+    document_id: Mapped[str] = mapped_column(String(128), index=True)
+    text: Mapped[str] = mapped_column(Text)
+    source: Mapped[str] = mapped_column(String(512))
+    page_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    section: Mapped[str | None] = mapped_column(String(512), nullable=True)

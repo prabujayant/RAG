@@ -20,7 +20,6 @@ dependencies = [
     "sqlalchemy>=2.0.30",
     "psycopg[binary]>=3.2",
     "qdrant-client>=1.10",
-    "opensearch-py>=2.5",
 
     # ML (embeddings + reranker)
     "sentence-transformers>=3.0",
@@ -47,6 +46,11 @@ dependencies = [
     "python-dotenv>=1.0",
     "tenacity>=8.3",
     "tiktoken>=0.7",
+    # Loads evals/thresholds.yaml, the single source of truth for regression gates.
+    "PyYAML>=6.0",
+
+    # Background tasks (ingestion/eval workers; local Redis via compose).
+    "celery[redis]>=5.4",
 ]
 
 [project.optional-dependencies]
@@ -104,7 +108,7 @@ markers = [
     "unit: Unit tests that run without external services (no DB, Docker, network, or model downloads).",
     "integration: Integration tests that connect multiple internal components.",
     "evaluation: Evaluation and benchmark tests.",
-    "requires_docker: Tests that require Docker containers (Postgres, Qdrant, OpenSearch).",
+    "requires_docker: Tests that require Docker containers (Postgres, Qdrant).",
     "requires_network: Tests that require network access to external services.",
     "slow: Tests that take longer than 5 seconds to run.",
 ]

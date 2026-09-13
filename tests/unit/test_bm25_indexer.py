@@ -1,176 +1,186 @@
-"""Unit tests for the OpenSearch-backed BM25Indexer.
+"""Unit tests for the Postgres-tsvector BM25Indexer.
 
-A fully in-memory fake OpenSearch client is used — no network, no docker.
-We exercise the public API (ensure/index/search/get/count/delete/multi_match).
+A fake session stands in for PostgreSQL — no network, no docker. It stores
+postings in memory and emulates the WHERE-clause semantics the indexer
+relies on (document_id ANY / NOT ANY). Real ranking fidelity (ts_rank_cd)
+is covered by the live-PG smoke test in tests/integration/.
 """
 
 from __future__ import annotations
 
-from collections import Counter
-
 import pytest
 from app.ingestion.chunker import Chunk, content_hash
+from app.retrieval import bm25 as bm25_mod
 from app.retrieval.bm25 import BM25Indexer
-from opensearchpy.exceptions import NotFoundError
 
-# ---------------------------------------------------------------- fake OS
+# ------------------------------------------------------------------- fakes
 
-class _FakeOpenSearch:
-    """Minimal OpenSearch stand-in: supports indices, bulk, get, count, search."""
 
-    # Use the real opensearchpy NotFoundError so production code paths that
-    # catch it also work against the fake.
-    NotFoundError = NotFoundError
+class _FakeScalarResult:
+    def __init__(self, value: object) -> None:
+        self._value = value
 
-    def __init__(self) -> None:
-        self.indices_map: dict[str, dict] = {}
-        self.docs: dict[str, dict[str, dict]] = {}  # index -> id -> source
-        self.last_bulk: list[dict] = []
+    def scalar(self) -> object:
+        return self._value
 
-    class _IndicesClient:
-        def __init__(self, parent: _FakeOpenSearch) -> None:
-            self.parent = parent
 
-        def exists(self, index):
-            return index in self.parent.indices_map
+class _FakeMappingsResult:
+    def __init__(self, rows: list[dict]) -> None:
+        self._rows = rows
 
-        def create(self, index, body):
-            if index in self.parent.indices_map:
-                return {}
-            self.parent.indices_map[index] = body
-            self.parent.docs.setdefault(index, {})
-            return {}
+    def mappings(self) -> _FakeMappingsResult:
+        return self
 
-        def delete(self, index):
-            self.parent.indices_map.pop(index, None)
-            self.parent.docs.pop(index, None)
-            return {}
+    def all(self) -> list[dict]:
+        return self._rows
 
-    @property
-    def indices(self) -> _IndicesClient:
-        return _FakeOpenSearch._IndicesClient(self)
-
-    # ---- docs
-    def bulk(self, body, refresh=False):  # noqa: ARG002
-        self.last_bulk = body
-        items = []
-        i = 0
-        while i < len(body):
-            op = body[i]
-            if "index" in op:
-                meta = op["index"]
-                idx = meta["_index"]
-                doc_id = meta["_id"]
-                source = body[i + 1]
-                self.docs.setdefault(idx, {})[doc_id] = source
-                items.append({"index": {"status": 201}})
-                i += 2
-            elif "delete" in op:
-                meta = op["delete"]
-                idx = meta["_index"]
-                doc_id = meta["_id"]
-                existed = self.docs.get(idx, {}).pop(doc_id, None) is not None
-                items.append({"delete": {"status": 200 if existed else 404}})
-                i += 1
-            else:
-                i += 1
-        return {"errors": False, "items": items}
-
-    def get(self, index, id):
-        if index not in self.indices_map or id not in self.docs.get(index, {}):
-            raise self.NotFoundError()
-        return {"_source": self.docs[index][id]}
-
-    def count(self, index, body):
-        if index not in self.indices_map:
-            raise self.NotFoundError()
-        if body["query"] == {"match_all": {}}:
-            return {"count": len(self.docs.get(index, {}))}
-        # term: document_id
-        term = body["query"].get("term", {}).get("document_id")
-        n = sum(1 for d in self.docs[index].values() if d.get("document_id") == term)
-        return {"count": n}
-
-    def search(self, index, body):
-        if index not in self.indices_map:
-            return {"hits": {"hits": []}}
-        size = body.get("size", 10)
-        must = body["query"]["bool"]["must"]
-        flt = body["query"]["bool"].get("filter", [])
-        query = must[0]["multi_match"]["query"]
-        fields = must[0]["multi_match"]["fields"]
-        wanted: set[str] = set()
-        for d in flt:
-            if "terms" in d:
-                val = d["terms"]["document_id"]
-                if isinstance(val, list):
-                    wanted.update(val)
-                else:
-                    wanted.add(val)
-        wanted = set(next(iter(wanted))) if wanted else None
-
-        scored = []
-        for doc_id, src in self.docs[index].items():
-            if wanted is not None and src.get("document_id") not in wanted:
-                continue
-            score = _bm25_score(query, fields, src)
-            scored.append((score, doc_id, src))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        scored = scored[:size]
-        return {
-            "hits": {
-                "hits": [
-                    {"_id": did, "_score": s, "_source": src} for s, did, src in scored
-                ]
-            }
-        }
-
-    def delete_by_query(self, index, body, refresh=True, conflicts="proceed"):  # noqa: ARG002
-        if index not in self.indices_map:
-            raise self.NotFoundError()
-        term = body["query"].get("term", {}).get("document_id")
-        to_delete = [d for d, s in self.docs[index].items() if s.get("document_id") == term]
-        for d in to_delete:
-            del self.docs[index][d]
-        return {"deleted": len(to_delete)}
-
-# ---------------------------------------------------------------- helpers
 
 def _tokens(text: str) -> list[str]:
-    return [t for t in text.lower().split() if t]
+    return [t for t in (text or "").lower().split() if t]
 
-def _bm25_score(query: str, fields: list[str], doc: dict) -> float:
-    """Toy BM25-like score so our tests are deterministic & inspectable."""
-    q_tokens = _tokens(query)
-    score = 0.0
-    k1, b = 1.5, 0.75
-    doc_tokens: list[str] = []
-    for f in fields:
-        v = doc.get(f)
-        if isinstance(v, str):
-            doc_tokens.extend(_tokens(v))
-    if not doc_tokens:
-        return 0.0
-    tf = Counter(doc_tokens)
-    doc_len = len(doc_tokens)
-    avg_dl = 1.0
-    for qt in q_tokens:
-        f = tf.get(qt, 0)
-        if f == 0:
-            continue
-        denom = f + k1 * (1 - b + b * doc_len / max(avg_dl, 1e-9))
-        score += (f * (k1 + 1)) / max(denom, 1e-9)
-    return score
+
+def _where_matches(src: dict, clause: object) -> bool:
+    """Evaluate a simple SQLAlchemy WHERE clause against an in-memory row.
+
+    Handles ``AND`` of ``column == value`` / ``column.in_(values)`` — the
+    only shapes the indexer generates.
+    """
+    from sqlalchemy.sql import operators
+
+    op = getattr(clause, "operator", None)
+    if op is operators.and_:
+        return all(_where_matches(src, c) for c in clause.clauses)  # type: ignore[attr-defined]
+    left = getattr(clause, "left", None)
+    right = getattr(clause, "right", None)
+    key = getattr(left, "key", None)
+    value = getattr(right, "value", None)
+    if key is None:
+        return True
+    if op is operators.in_op:
+        values = value if isinstance(value, (list, tuple, set)) else [value]
+        return src.get(key) in values
+    return src.get(key) == value
+
+
+class _FakeSession:
+    """In-memory stand-in for a SQLAlchemy session."""
+
+    def __init__(self) -> None:
+        self.postings: dict[str, dict] = {}
+        self.statements: list[str] = []
+
+    # context-manager protocol (session_factory returns self)
+    def __enter__(self) -> _FakeSession:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def commit(self) -> None:
+        return None
+
+    # -- ORM surface used by the indexer -------------------------------
+    def merge(self, obj: object) -> None:
+        self.postings[obj.chunk_id] = {  # type: ignore[attr-defined]
+            "chunk_id": obj.chunk_id,  # type: ignore[attr-defined]
+            "document_id": obj.document_id,  # type: ignore[attr-defined]
+            "text": obj.text,  # type: ignore[attr-defined]
+            "source": obj.source,  # type: ignore[attr-defined]
+            "page_number": obj.page_number,  # type: ignore[attr-defined]
+            "section": obj.section,  # type: ignore[attr-defined]
+        }
+
+    def get(self, _model: object, key: str) -> object | None:
+        from types import SimpleNamespace
+
+        src = self.postings.get(key)
+        return SimpleNamespace(**src) if src is not None else None
+
+    def query(self, _model: object) -> _FakeQuery:
+        return _FakeQuery(self)
+
+    # -- Core surface ----------------------------------------------------
+    def execute(self, stmt: object, params: dict | None = None):
+        sql = str(getattr(stmt, "text", stmt))
+        self.statements.append(sql)
+        params = params or {}
+        if "ts_rank_cd" in sql:
+            return _FakeMappingsResult(self._search(params))
+        if "COUNT" in sql.upper():
+            where = getattr(stmt, "whereclause", None)
+            rows = [
+                src for src in self.postings.values()
+                if where is None or _where_matches(src, where)
+            ]
+            return _FakeScalarResult(len(rows))
+        # DDL / anything else: succeed silently.
+        return _FakeMappingsResult([])
+
+    # -- emulation --------------------------------------------------------
+    def _search(self, params: dict) -> list[dict]:
+        query = params.get("q", "")
+        wanted = params.get("f")
+        banned = set(params.get("e") or [])
+        k = params.get("k", 20)
+        q_tokens = set(_tokens(query))
+        scored = []
+        for pid, src in self.postings.items():
+            if wanted is not None and src["document_id"] not in wanted:
+                continue
+            if src["document_id"] in banned:
+                continue
+            hay = set(_tokens(src["text"])) | set(_tokens(src.get("section") or ""))
+            overlap = len(q_tokens & hay)
+            if overlap == 0:
+                continue
+            scored.append((overlap, pid, src))
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        return [
+            {
+                "chunk_id": pid,
+                "document_id": src["document_id"],
+                "text": src["text"],
+                "source": src["source"],
+                "page_number": src["page_number"],
+                "section": src["section"],
+                "score": float(overlap),
+            }
+            for overlap, pid, src in scored[:k]
+        ]
+
+
+class _FakeQuery:
+    def __init__(self, session: _FakeSession) -> None:
+        self._session = session
+        self._filters: list = []
+
+    def filter(self, *criteria) -> _FakeQuery:
+        self._filters.extend(criteria)
+        return self
+
+    def _matches(self, src: dict) -> bool:
+        return all(_where_matches(src, crit) for crit in self._filters)
+
+    def delete(self, synchronize_session: bool = False) -> int:  # noqa: ARG002
+        doomed = [pid for pid, src in self._session.postings.items() if self._matches(src)]
+        for pid in doomed:
+            del self._session.postings[pid]
+        return len(doomed)
+
 
 # ---------------------------------------------------------------- fixtures
 
-@pytest.fixture
-def fake_os() -> _FakeOpenSearch:
-    return _FakeOpenSearch()
 
 @pytest.fixture
-def indexer(fake_os) -> BM25Indexer:
-    return BM25Indexer(client=fake_os)
+def fake_session() -> _FakeSession:
+    bm25_mod._ENSURED.clear()
+    return _FakeSession()
+
+
+@pytest.fixture
+def indexer(fake_session) -> BM25Indexer:
+    return BM25Indexer(settings=None, session_factory=lambda: fake_session)
+
 
 def _make_chunks(document_id: str, texts: list[str]) -> list[Chunk]:
     return [
@@ -188,32 +198,49 @@ def _make_chunks(document_id: str, texts: list[str]) -> list[Chunk]:
         for i, t in enumerate(texts)
     ]
 
+
 # ---------------------------------------------------------------- tests
 
-def test_ensure_index_creates_standard_analyzer(indexer, fake_os) -> None:
-    indexer.ensure_index()
-    body = fake_os.indices_map["askmydocs_chunks"]
-    assert body["mappings"]["properties"]["text"]["type"] == "text"
-    assert body["settings"]["analysis"]["analyzer"]["default"]["type"] == "standard"
 
-def test_ensure_index_idempotent(indexer) -> None:
+def test_ensure_index_runs_tsvector_ddl(fake_session, indexer) -> None:
     indexer.ensure_index()
-    indexer.ensure_index()  # should not raise
+    joined = "\n".join(fake_session.statements)
+    assert "tsvector" in joined
+    assert "GIN" in joined
+    assert "keyword_postings_tsv_trigger" in joined
 
-def test_index_documents_writes_payload(indexer, fake_os) -> None:
+
+def test_ensure_index_idempotent(fake_session, indexer) -> None:
+    indexer.ensure_index()
+    n = len(fake_session.statements)
+    indexer.ensure_index()  # memoized: no new statements
+    assert len(fake_session.statements) == n
+
+
+def test_index_documents_upserts_postings(indexer, fake_session) -> None:
     chunks = _make_chunks("auth", ["OAuth tokens expire after 60 minutes.", "Rate limits are hourly."])
     indexer.index_documents(chunks)
-    docs = fake_os.docs["askmydocs_chunks"]
-    assert set(docs.keys()) == {"auth:0", "auth:1"}
-    assert docs["auth:0"]["text"] == "OAuth tokens expire after 60 minutes."
+    assert set(fake_session.postings.keys()) == {"auth:0", "auth:1"}
+    assert fake_session.postings["auth:0"]["text"] == "OAuth tokens expire after 60 minutes."
 
-def test_index_documents_empty_noop(indexer, fake_os) -> None:
+
+def test_index_documents_empty_noop(indexer, fake_session) -> None:
     indexer.index_documents([])
-    assert fake_os.docs == {}
+    assert fake_session.postings == {}
+
 
 def test_upsert_returns_count(indexer) -> None:
     chunks = _make_chunks("auth", ["a", "b", "c"])
     assert indexer.upsert(chunks) == 3
+
+
+def test_search_uses_ts_rank(indexer, fake_session) -> None:
+    indexer.index_documents(_make_chunks("a", ["hello world"]))
+    indexer.search("hello")
+    joined = "\n".join(fake_session.statements)
+    assert "ts_rank_cd" in joined
+    assert "websearch_to_tsquery" in joined
+
 
 def test_search_basic(indexer) -> None:
     chunks = _make_chunks(
@@ -231,19 +258,35 @@ def test_search_basic(indexer) -> None:
     assert res[0]["score"] > 0
     assert "OAuth" in res[0]["payload"]["text"]
 
+
+def test_search_blank_query_short_circuits(indexer, fake_session) -> None:
+    indexer.index_documents(_make_chunks("a", ["hello world"]))
+    n_before = len(fake_session.statements)
+    assert indexer.search("   ") == []
+    assert len(fake_session.statements) == n_before  # no SQL issued
+
+
 def test_search_filter_document_ids(indexer) -> None:
     indexer.index_documents(_make_chunks("a", ["OAuth tokens"]))
     indexer.index_documents(_make_chunks("b", ["OAuth tokens"]))
     res = indexer.search("OAuth", filter_document_ids=["a"])
     assert {r["payload"]["document_id"] for r in res} == {"a"}
 
-def test_search_multi_match_fields(indexer) -> None:
+
+def test_search_exclude_document_ids(indexer) -> None:
+    indexer.index_documents(_make_chunks("a", ["OAuth tokens"]))
+    indexer.index_documents(_make_chunks("b", ["OAuth tokens"]))
+    res = indexer.search("OAuth", exclude_document_ids=["b"])
+    assert {r["payload"]["document_id"] for r in res} == {"a"}
+
+
+def test_search_section_weighted(indexer) -> None:
     chunks = _make_chunks("a", ["plain body", "another body"])
-    # Force the second chunk's section field to match the query.
     chunks[1].section = "OAuth troubleshooting"
     indexer.index_documents(chunks)
-    res = indexer.search("OAuth", fields=["text", "section"])
+    res = indexer.search("OAuth")
     assert res[0]["id"] == "a:1"
+
 
 def test_count_and_by_document(indexer) -> None:
     indexer.index_documents(_make_chunks("a", ["x", "y"]))
@@ -251,37 +294,38 @@ def test_count_and_by_document(indexer) -> None:
     assert indexer.count() == 3
     assert indexer.count(document_id="a") == 2
 
-def test_get_returns_source(indexer) -> None:
+
+def test_get_returns_posting(indexer) -> None:
     chunks = _make_chunks("a", ["hello world"])
     indexer.index_documents(chunks)
     src = indexer.get("a:0")
     assert src is not None
     assert src["text"] == "hello world"
 
+
 def test_get_missing_returns_none(indexer) -> None:
     assert indexer.get("nope") is None
 
-def test_delete_by_document(indexer) -> None:
+
+def test_delete_by_document(indexer, fake_session) -> None:
     indexer.index_documents(_make_chunks("a", ["x", "y"]))
     indexer.index_documents(_make_chunks("b", ["z"]))
     assert indexer.delete_by_document("a") == 2
-    assert indexer.count(document_id="a") == 0
-    assert indexer.count() == 1
+    assert fake_session.postings.keys() == {"b:0"}
 
-def test_delete_by_ids(indexer) -> None:
+
+def test_delete_by_ids(indexer, fake_session) -> None:
     indexer.index_documents(_make_chunks("a", ["x", "y", "z"]))
     assert indexer.delete_by_ids(["a:0", "a:2"]) == 2
-    assert indexer.count() == 1
+    assert set(fake_session.postings.keys()) == {"a:1"}
+
 
 def test_delete_by_ids_empty(indexer) -> None:
     assert indexer.delete_by_ids([]) == 0
 
-def test_delete_index_is_idempotent(indexer, fake_os) -> None:
-    indexer.ensure_index()
-    indexer.delete_index()
-    indexer.delete_index()  # no raise
-    assert "askmydocs_chunks" not in fake_os.indices_map
 
-def test_count_when_index_missing_returns_zero(indexer) -> None:
-    assert indexer.count() == 0
-    assert indexer.delete_by_document("nope") == 0
+def test_delete_index_clears_postings(indexer, fake_session) -> None:
+    indexer.ensure_index()
+    indexer.index_documents(_make_chunks("a", ["x"]))
+    indexer.delete_index()
+    assert fake_session.postings == {}

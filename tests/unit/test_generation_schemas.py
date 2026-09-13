@@ -87,12 +87,12 @@ def test_answer_response_round_trip() -> None:
         refused=False,
         refused_reason=None,
         total_latency_ms=123.4,
-        model="openai/gpt-4o-mini",
+        model="nvidia/nemotron-3.5-lightning:free",
     )
     restored = AnswerResponse.from_dict(resp.to_dict())
     assert restored == resp
     assert restored.grounded is True
-    assert restored.model == "openai/gpt-4o-mini"
+    assert restored.model == "nvidia/nemotron-3.5-lightning:free"
 
 def test_answer_response_refused() -> None:
     resp = AnswerResponse(

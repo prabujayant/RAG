@@ -123,6 +123,9 @@ class _FakeQdrantClient:
                 wanted_docs = _extract_match_any(query_filter)
                 if wanted_docs is not None and p.payload.get("document_id") not in wanted_docs:
                     continue
+                banned_docs = _extract_must_not(query_filter)
+                if p.payload.get("document_id") in banned_docs:
+                    continue
             scored.append((score, p))
         scored.sort(key=lambda x: x[0], reverse=True)
         scored = scored[:limit]
@@ -181,11 +184,19 @@ def _cosine(a: list[float], b: list[float]) -> float:
     return dot / (na * nb)
 
 def _extract_match_any(flt) -> set[str] | None:
-    for cond in flt.must:
+    for cond in getattr(flt, "must", None) or []:
         m = getattr(cond, "match", None)
         if m is not None and hasattr(m, "any"):
             return set(m.any)
     return None
+
+def _extract_must_not(flt) -> set[str]:
+    out: set[str] = set()
+    for cond in getattr(flt, "must_not", None) or []:
+        m = getattr(cond, "match", None)
+        if m is not None and hasattr(m, "any"):
+            out.update(m.any)
+    return out
 
 # ---------------------------------------------------------------- fixtures
 
@@ -219,6 +230,38 @@ def test_ensure_collection_idempotent(store, fake_client) -> None:
     store.ensure_collection()
     store.ensure_collection()  # should not raise
     assert "askmydocs_chunks" in fake_client.collections
+
+def test_ensure_collection_not_skipped_for_recycled_client_id() -> None:
+    """A brand-new client must not be mistaken for an already-ensured one.
+
+    The memoization used to be keyed on ``id(client)``. CPython recycles
+    ``id()`` values after garbage collection, so a later client could reuse a
+    dead client's id and have collection creation wrongly skipped — producing
+    ``KeyError: 'askmydocs_chunks'``. Keys are now weak references to the
+    client itself.
+    """
+    created: list[object] = []
+
+    # Hold each client only weakly from the store's perspective: drop our
+    # reference so the next client is likely to reuse the same memory address.
+    for _ in range(30):
+        client = _FakeQdrantClient()
+        created.append(client)
+        VectorStore(client=client).ensure_collection()
+        assert "askmydocs_chunks" in client.collections
+
+    # Force garbage collection, then ensure a fresh client still gets created.
+    del created
+    import gc
+
+    gc.collect()
+
+    fresh = _FakeQdrantClient()
+    VectorStore(client=fresh).ensure_collection()
+    assert "askmydocs_chunks" in fresh.collections, (
+        "ensure_collection was skipped for a fresh client — memoization key "
+        "collision (id() reuse)."
+    )
 
 def test_upsert_uses_real_vectors_and_payload(store, fake_client) -> None:
     chunks = _make_chunks("doc-1", 2)
@@ -269,6 +312,14 @@ def test_search_filter_document_ids(store) -> None:
     store.upsert(chunks_a, vectors=[[0.0] * 1024] * 2)
     store.upsert(chunks_b, vectors=[[0.0] * 1024] * 2)
     results = store.search([0.0] * 1024, top_k=10, filter_document_ids=["doc-a"])
+    assert {r["payload"]["document_id"] for r in results} == {"doc-a"}
+
+def test_search_exclude_document_ids(store) -> None:
+    chunks_a = _make_chunks("doc-a", 2)
+    chunks_b = _make_chunks("doc-b", 2)
+    store.upsert(chunks_a, vectors=[[0.0] * 1024] * 2)
+    store.upsert(chunks_b, vectors=[[0.0] * 1024] * 2)
+    results = store.search([0.0] * 1024, top_k=10, exclude_document_ids=["doc-b"])
     assert {r["payload"]["document_id"] for r in results} == {"doc-a"}
 
 def test_count_total_and_by_document(store) -> None:

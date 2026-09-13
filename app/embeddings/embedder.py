@@ -9,6 +9,7 @@ asymmetric pattern for BGE-M3.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Iterable
 from functools import lru_cache
 from typing import TYPE_CHECKING
@@ -38,13 +39,42 @@ BGE_M3_DIM = 1024
 
 
 @lru_cache(maxsize=1)
-def _get_shared_model(model_name: str) -> "SentenceTransformer":
-    """Load and cache the sentence-transformer model at module scope."""
-    logger.info("Loading embedding model %s …", model_name)
+def _get_shared_model(model_name: str) -> SentenceTransformer:
+    """Load and cache the sentence-transformer model at module scope.
+
+    Attempts a local-only load first. The model is normally already present in
+    the HuggingFace cache, and skipping the hub update check cuts load time
+    from ~50s to a few seconds. Falls back to a normal (downloading) load when
+    the model is not cached yet, so a fresh machine still works.
+    """
     from sentence_transformers import SentenceTransformer
 
-    model = SentenceTransformer(model_name)
-    logger.info("Embedding model %s loaded", model_name)
+    # CPU encode scales with threads + batch size. Batch comes from
+    # EMBEDDING_BATCH_SIZE (now 64); threads default to all cores so a
+    # 150-chunk PDF encodes in one pass instead of ten.
+    try:
+        import os
+
+        import torch
+
+        torch.set_num_threads(os.cpu_count() or 4)
+    except Exception:
+        pass
+
+    logger.info("Loading embedding model %s …", model_name)
+    start = time.perf_counter()
+    try:
+        model = SentenceTransformer(model_name, local_files_only=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.info(
+            "%s not available in the local cache (%s); loading from HuggingFace",
+            model_name,
+            exc,
+        )
+        model = SentenceTransformer(model_name)
+    logger.info(
+        "Embedding model %s loaded in %.1fs", model_name, time.perf_counter() - start
+    )
     return model
 
 
@@ -59,23 +89,32 @@ class Embedder:
     vector_store:
         Optional pre-built :class:`VectorStore` to upsert into. When ``None``,
         a new instance is created lazily from settings on first upsert.
+    model:
+        Optional pre-constructed ``SentenceTransformer`` instance (useful for
+        tests with fake models). When omitted the shared module-level model
+        is loaded lazily on first use.
     """
 
     def __init__(
         self,
         settings: Settings | None = None,
         vector_store: VectorStore | None = None,
+        model: SentenceTransformer | None = None,
     ) -> None:
         s = settings or get_settings()
         self.model_name = s.embedding_model
         self.batch_size = s.embedding_batch_size
         self.vector_size = s.embedding_dim
         self._vector_store = vector_store
+        self._model = model
 
     @property
-    def model(self) -> "SentenceTransformer":
-        """Return the shared sentence-transformer model (loaded once)."""
-        return _get_shared_model(self.model_name)
+    def model(self) -> SentenceTransformer:
+        """Return the injected model, else the shared sentence-transformer
+        model (loaded once)."""
+        if self._model is None:
+            self._model = _get_shared_model(self.model_name)
+        return self._model
 
     def _check_dim(self, vectors: list[list[float]]) -> None:
         """Fail fast when the model output disagrees with configured EMBEDDING_DIM."""

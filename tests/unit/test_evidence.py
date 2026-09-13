@@ -99,6 +99,34 @@ class TestEvidenceSelector:
         second = selector.select(candidates)
         assert [c.chunk_id for c in first] == [c.chunk_id for c in second]
 
+    def test_close_scores_prefer_fresh_documents(self) -> None:
+        """Diversity is real: a close runner-up from a new doc beats a same-doc chunk."""
+        selector = EvidenceSelector(settings=None)  # type: ignore[arg-type]
+        selector._settings = selector._settings.model_copy(
+            update={"final_context_k": 2, "max_context_tokens": 100000}
+        )
+        candidates = [
+            _result("a:0", "a", "x", 0.90),
+            _result("a:1", "a", "x", 0.89),  # same doc, barely lower
+            _result("b:0", "b", "x", 0.80),  # fresh doc: 0.80 > 0.89 * 1/2
+        ]
+        selected = selector.select(candidates)
+        assert [c.chunk_id for c in selected] == ["a:0", "b:0"]
+
+    def test_clear_winner_beats_diversity(self) -> None:
+        """A clearly better same-doc chunk still wins despite the penalty."""
+        selector = EvidenceSelector(settings=None)  # type: ignore[arg-type]
+        selector._settings = selector._settings.model_copy(
+            update={"final_context_k": 2, "max_context_tokens": 100000}
+        )
+        candidates = [
+            _result("a:0", "a", "x", 0.90),
+            _result("a:1", "a", "x", 0.85),  # 0.85 * 1/2 = 0.425
+            _result("b:0", "b", "x", 0.40),  # fresh doc but far behind
+        ]
+        selected = selector.select(candidates)
+        assert [c.chunk_id for c in selected] == ["a:0", "a:1"]
+
     def test_metadata_preserved(self) -> None:
         """Retrieved metadata (source, page_number, section) is preserved."""
         result = RetrievalResult(

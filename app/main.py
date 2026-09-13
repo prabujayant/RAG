@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -12,6 +14,7 @@ from fastapi.responses import JSONResponse
 
 from app.api.routes import documents, health, query
 from app.config import get_settings
+from app.config.settings import Settings
 from app.observability import (
     RequestContext,
     get_logger,
@@ -38,8 +41,56 @@ async def lifespan(app: FastAPI):
         settings.app_env,
         "enabled" if getattr(tracer, "enabled", False) else "disabled",
     )
+    await _warmup_models(settings)
     yield
     logger.info("AskMyDocs shutting down")
+
+
+async def _warmup_models(settings: Settings) -> None:
+    """Pre-load the embedding model so the first query stays fast.
+
+    BGE-M3 loads lazily on first use (~50s on CPU). Warming it here moves
+    that cost to startup, where it belongs. Failures are non-fatal: the
+    model will simply load on first use instead.
+    """
+    if not settings.warmup_models:
+        logger.info("Model warm-up disabled (WARMUP_MODELS=false)")
+        return
+    try:
+        from app.embeddings.embedder import Embedder
+
+        start = time.perf_counter()
+        # Blocking CPU work — keep it off the event loop.
+        await asyncio.to_thread(Embedder(settings=settings).embed_queries, ["warmup"])
+        logger.info(
+            "Embedding model warmed up in %.1fs", time.perf_counter() - start
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Model warm-up failed; first query will load the model lazily: %s",
+            exc,
+        )
+
+    # The cross-encoder is on the live /query path — warm it too so the
+    # first reranked query doesn't pay the model-load cost.
+    if not settings.enable_reranker:
+        logger.info("Reranker warm-up skipped (ENABLE_RERANKER=false)")
+        return
+    try:
+        from app.retrieval.reranker import Reranker
+
+        start = time.perf_counter()
+        loaded = await asyncio.to_thread(Reranker(settings=settings).warmup)
+        logger.info(
+            "Reranker warm-up finished in %.1fs (loaded=%s)",
+            time.perf_counter() - start,
+            loaded,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Reranker warm-up failed; first rerank will load lazily: %s",
+            exc,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -128,11 +179,24 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # CORS -- allow all origins for now (configure as needed)
+    # CORS — "*" locally; restrict via CORS_ORIGINS in production
+    # (e.g. "https://askmydocs.vercel.app"). Comma-separated list supported.
+    # NOTE: allow_credentials is auto-disabled for a wildcard origin: browsers
+    # reject `Access-Control-Allow-Origin: *` combined with credentials, so
+    # shipping both would silently break credentialed cross-origin requests.
+    raw_origins = getattr(get_settings(), "cors_origins", "*")
+    allow_origins = [o.strip() for o in str(raw_origins).split(",") if o.strip()] or ["*"]
+    allow_credentials = allow_origins != ["*"]
+    if not allow_credentials:
+        logger.warning(
+            "CORS origins are wildcarded; allow_credentials disabled "
+            "(browsers reject '*' + credentials). Set CORS_ORIGINS explicitly "
+            "in production to re-enable credentialed requests."
+        )
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
+        allow_origins=allow_origins,
+        allow_credentials=allow_credentials,
         allow_methods=["*"],
         allow_headers=["*"],
     )

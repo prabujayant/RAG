@@ -91,6 +91,9 @@ class TestOpenRouterClient:
                 openrouter_model="test/model",
                 openrouter_base_url="https://api.test/v1",
                 llm_timeout_seconds=30.0,
+                llm_json_mode=True,
+                # No retries: keeps unit tests fast and deterministic.
+                llm_max_retries=0,
             ),
             http_client=http_client,
         )
@@ -116,7 +119,11 @@ class TestOpenRouterClient:
     def test_generate_raises_on_missing_api_key(self) -> None:
         """Missing API key raises a clear error."""
         client = OpenRouterClient(
-            settings=MagicMock(openrouter_api_key=""),
+            settings=MagicMock(
+                openrouter_api_key="",
+                openrouter_base_url="https://api.test/v1",
+                llm_timeout_seconds=30.0,
+            ),
         )
         with pytest.raises(ValueError, match="OPENROUTER_API_KEY"):
             client.generate(
@@ -140,6 +147,8 @@ class TestOpenRouterClient:
                 openrouter_model="m",
                 openrouter_base_url="https://x/v1",
                 llm_timeout_seconds=30.0,
+                llm_json_mode=True,
+                llm_max_retries=0,
             ),
             http_client=http_client,
         )
@@ -152,6 +161,59 @@ class TestOpenRouterClient:
         )
         payload = http_client.post.call_args[1]["json"]
         assert payload.get("temperature") == 0.7
+
+    def test_reasoning_param_absent_on_high(self) -> None:
+        """Default effort sends no reasoning override (provider default)."""
+        http_client = MagicMock(spec=httpx.Client)
+        fake_request = httpx.Request("POST", "https://x/v1/chat/completions")
+        http_client.post.return_value = httpx.Response(200, json={
+            "model": "m",
+            "choices": [{"message": {"content": "x"}}],
+        }, request=fake_request)
+        client = OpenRouterClient(
+            settings=MagicMock(
+                openrouter_api_key="k",
+                openrouter_model="m",
+                openrouter_base_url="https://x/v1",
+                llm_timeout_seconds=30.0,
+                llm_json_mode=False,
+                llm_max_retries=0,
+                llm_reasoning_effort="high",
+            ),
+            http_client=http_client,
+        )
+        client.generate(
+            system_prompt="s", user_prompt="u", evidence_context="c",
+            max_output_tokens=10,
+        )
+        assert "reasoning" not in http_client.post.call_args[1]["json"]
+
+    def test_reasoning_param_sent_on_medium(self) -> None:
+        """Lowered effort is forwarded as OpenRouter's reasoning.effort."""
+        http_client = MagicMock(spec=httpx.Client)
+        fake_request = httpx.Request("POST", "https://x/v1/chat/completions")
+        http_client.post.return_value = httpx.Response(200, json={
+            "model": "m",
+            "choices": [{"message": {"content": "x"}}],
+        }, request=fake_request)
+        client = OpenRouterClient(
+            settings=MagicMock(
+                openrouter_api_key="k",
+                openrouter_model="m",
+                openrouter_base_url="https://x/v1",
+                llm_timeout_seconds=30.0,
+                llm_json_mode=False,
+                llm_max_retries=0,
+                llm_reasoning_effort="medium",
+            ),
+            http_client=http_client,
+        )
+        client.generate(
+            system_prompt="s", user_prompt="u", evidence_context="c",
+            max_output_tokens=10,
+        )
+        payload = http_client.post.call_args[1]["json"]
+        assert payload.get("reasoning") == {"effort": "medium"}
 
     def test_generate_raises_on_empty_choices(self) -> None:
         """Unexpected response shape (no choices) raises ValueError."""

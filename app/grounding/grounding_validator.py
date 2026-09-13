@@ -6,9 +6,7 @@ and produces a grounded response with status and confidence.
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -20,6 +18,7 @@ from app.generation.schemas import (
     CitationStatus,
     GroundingStatus,
 )
+from app.generation.service import extract_json, safe_parse_json
 from app.grounding.citation_validator import CitationValidator, ValidationResult
 from app.grounding.claims import Claim, ClaimExtractor
 
@@ -43,11 +42,7 @@ _LLM_JUDGE_SYSTEM = (
     "Be strict: invented or unreferenced facts must be marked unsupported."
 )
 
-_LLM_JUDGE_USER = (
-    "CLAIM: {claim}\n\n"
-    "EVIDENCE (source: {source}, section: {section}):\n"
-    "{evidence}"
-)
+_LLM_JUDGE_USER = "CLAIM: {claim}\n\nEVIDENCE (source: {source}, section: {section}):\n{evidence}"
 
 
 def _build_llm_judge_messages(
@@ -71,28 +66,22 @@ def _build_llm_judge_messages(
 # ValidationResult helpers
 # ---------------------------------------------------------------------------
 
-def _parse_llm_judge_response(raw: str) -> dict | None:
-    """Extract JSON from the LLM judge response."""
-    # Try fenced JSON first
-    fenced = re.search(r"```json\s*(\{.*?\})\s*```", raw, re.DOTALL)
-    if fenced:
-        try:
-            return json.loads(fenced.group(1))
-        except json.JSONDecodeError:
-            pass
-    # Try bare JSON object
-    bare = re.search(r"\{.*\}", raw, re.DOTALL)
-    if bare:
-        try:
-            return json.loads(bare.group(0))
-        except json.JSONDecodeError:
-            pass
-    return None
+
+def _parse_llm_judge_response(raw: str | None) -> dict | None:
+    """Extract the judge's JSON verdict, or ``None`` when unavailable.
+
+    Delegates to the shared extraction helpers so reasoning-model output
+    (chain-of-thought preamble followed by the JSON payload) is handled the
+    same way as answer generation. Never raises on ``None`` input.
+    """
+    parsed = safe_parse_json(extract_json(raw))
+    return parsed if isinstance(parsed, dict) else None
 
 
 # ---------------------------------------------------------------------------
 # GroundingValidator
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class GroundingConfig:
@@ -101,19 +90,23 @@ class GroundingConfig:
     Attributes
     ----------
     use_llm_judge:
-        Whether to use the LLM judge for validation. Default False (deterministic only).
+        Whether to use the LLM judge for validation. Default True (falls back
+        to deterministic checks when the judge is unavailable or fails).
     supported_threshold:
-        Token overlap ratio for SUPPORTED. Default 0.65.
+        Token overlap ratio for SUPPORTED. Default 0.55.
     partial_threshold:
-        Token overlap ratio for PARTIALLY_SUPPORTED. Default 0.30.
+        Token overlap ratio for PARTIALLY_SUPPORTED. Default 0.20.
     confidence_scale_with_support:
         If True, confidence is multiplied by average support score. Default True.
+    judge_max_tokens:
+        Max completion tokens for the LLM judge's JSON verdict.
     """
 
     use_llm_judge: bool = True
     supported_threshold: float = 0.55
     partial_threshold: float = 0.20
     confidence_scale_with_support: bool = True
+    judge_max_tokens: int = 512
 
 
 class GroundingValidator:
@@ -174,9 +167,7 @@ class GroundingValidator:
         if raw_claims:
             with ThreadPoolExecutor(max_workers=min(len(raw_claims), 8)) as pool:
                 futures = {
-                    pool.submit(
-                        self._validate_claim, raw, citation_map, response.citations
-                    ): idx
+                    pool.submit(self._validate_claim, raw, citation_map, response.citations): idx
                     for idx, raw in enumerate(raw_claims)
                 }
                 # Collect results in submission order to preserve claim sequence
@@ -188,6 +179,13 @@ class GroundingValidator:
 
         # Calculate aggregate grounding status
         grounding_status = self._compute_grounding_status(validated_claims, response.refused)
+
+        # A general-mode answer may include context beyond the document, so it
+        # can never be reported as *fully* grounded even when every cited claim
+        # checks out. Called-out here so the API contract ("generic answers are
+        # never grounded") holds regardless of the claim verdicts.
+        if response.generic and grounding_status == GroundingStatus.GROUNDED:
+            grounding_status = GroundingStatus.PARTIALLY_GROUNDED
 
         # Calculate grounding confidence
         confidence = self._compute_confidence(
@@ -207,8 +205,10 @@ class GroundingValidator:
             confidence=confidence,
             refused=response.refused,
             refused_reason=response.refused_reason,
+            generic=response.generic,
             total_latency_ms=response.total_latency_ms,
             model=response.model,
+            usage=response.usage,
         )
 
     def _validate_claim(
@@ -245,7 +245,11 @@ class GroundingValidator:
 
             evidence_text = citation.text
             validation_result = self._do_validate(
-                raw.text, evidence_text, cid, citation.section, None,
+                raw.text,
+                evidence_text,
+                cid,
+                citation.section,
+                None,
             )
             validated_statuses.append(validation_result.status)
             reasons.append(f"[{cid}] {validation_result.reason}")
@@ -313,17 +317,23 @@ class GroundingValidator:
         if self._llm_client is None:
             return None
 
-        system_prompt, user_prompt = _build_llm_judge_messages(
-            claim, evidence, section, source
-        )
+        system_prompt, user_prompt = _build_llm_judge_messages(claim, evidence, section, source)
 
         try:
             raw_response = self._llm_client.generate(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                evidence_context=evidence,
-                max_output_tokens=150,
+                # The evidence is already interpolated into `user_prompt`; passing
+                # it again here duplicates it in the message body and makes the
+                # verdict less reliable.
+                evidence_context="",
+                max_output_tokens=self.config.judge_max_tokens,
                 temperature=0.0,
+                # Fail fast: an empty/failed verdict falls back to the
+                # deterministic validator, and each retry costs a full LLM
+                # round trip that would inflate query latency.
+                max_retries=0,
+                usage_label="grounding",
             )
             return _parse_llm_judge_response(raw_response.text)
         except Exception:
@@ -377,8 +387,10 @@ class GroundingValidator:
 
         # Average claim support score from the validator
         claim_scores = [
-            1.0 if c.status == CitationStatus.SUPPORTED
-            else 0.5 if c.status == CitationStatus.PARTIALLY_SUPPORTED
+            1.0
+            if c.status == CitationStatus.SUPPORTED
+            else 0.5
+            if c.status == CitationStatus.PARTIALLY_SUPPORTED
             else 0.0
             for c in claims
         ]
@@ -410,6 +422,8 @@ class GroundingValidator:
             confidence=0.0,
             refused=True,
             refused_reason=response.refused_reason,
+            generic=False,
             total_latency_ms=response.total_latency_ms,
             model=response.model,
+            usage=response.usage,
         )

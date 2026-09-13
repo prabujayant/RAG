@@ -27,6 +27,20 @@ class _FakeCrossEncoder:
         return self._scores[: len(pairs)]
 
 class TestReranker:
+    def test_default_model_is_small_multilingual_minilm(self) -> None:
+        """The default reranker is the ~118M multilingual MiniLM.
+
+        Chosen over BAAI/bge-reranker-v2-m3 (568M) after benchmarking:
+        404 ms/pair vs 7898 ms/pair on CPU (~20x), with strong ranking margins
+        on EN/DE/ID. The English-only MiniLM was rejected because it scored
+        relevant German passages negative.
+        """
+        from app.config import get_settings
+
+        assert get_settings().reranker_model == (
+            "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
+        )
+
     def test_rerank_updates_scores_and_order(self) -> None:
         """Reranking re-orders candidates by cross-encoder scores."""
         candidates = [_result("a:0", 0.9), _result("b:0", 0.8), _result("c:0", 0.7)]

@@ -28,6 +28,8 @@ from app.embeddings.embedder import Embedder
 from app.ingestion.chunker import Chunk, Chunker
 from app.ingestion.cleaner import clean_text
 from app.ingestion.parsers import extract_docx, extract_html, extract_markdown, extract_pdf
+from app.observability.metrics import record
+from app.observability.timing import time_operation
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +77,7 @@ class IngestResult:
     title: str
     chunk_count: int
     job_id: str
+    stage_ms: dict[str, float] | None = None
 
 
 # --------------------------------------------------------------------------  .
@@ -116,7 +119,7 @@ class IngestionPipeline:
         2. Clean the extracted text.
         3. Chunk the cleaned text.
         4. Store chunk metadata in PostgreSQL.
-        5. Compute embeddings and upsert to Qdrant + OpenSearch BM25.
+        5. Compute embeddings and upsert to Qdrant + keyword postings.
 
         Returns
         -------
@@ -129,36 +132,54 @@ class IngestionPipeline:
 
         # Create a running IngestionJob record.
         job = self._create_ingestion_job(doc_id)
+        stage_ms: dict[str, float] = {}
 
         try:
             # 1. Parse
-            parser = _parser_for(file_path)
-            parsed = parser(file_path)
+            with time_operation("ingest.parse", log_on_exit=False) as t:
+                parser = _parser_for(file_path)
+                parsed = parser(file_path)
+            stage_ms["parse"] = t.duration_ms
             logger.info("Parsed %s: %d chars raw", file_path, len(parsed.text))
 
             # 2. Clean
-            cleaned = clean_text(parsed.text)
+            with time_operation("ingest.clean", log_on_exit=False) as t:
+                cleaned = clean_text(parsed.text)
+            stage_ms["clean"] = t.duration_ms
             logger.info("Cleaned %s: %d chars after cleaning", file_path, len(cleaned))
 
             # 3. Chunk
-            chunks: list[Chunk] = self.chunker.chunk(
-                text=cleaned,
-                document_id=doc_id,
-                document_name=file_path.stem,
-                source=str(file_path),
-            )
+            with time_operation("ingest.chunk", log_on_exit=False) as t:
+                chunks: list[Chunk] = self.chunker.chunk(
+                    text=cleaned,
+                    document_id=doc_id,
+                    document_name=file_path.stem,
+                    source=str(file_path),
+                )
+            stage_ms["chunk"] = t.duration_ms
             logger.info("Chunked %s: %d chunks produced", file_path, len(chunks))
 
-            # 4 & 5. Persist to PostgreSQL + index in Qdrant / OpenSearch
-            self._persist_chunks(chunks, doc_id, title or file_path.stem)
+            # 4 & 5. Persist to PostgreSQL + index in Qdrant / keyword postings
+            persist_stages = self._persist_chunks(chunks, doc_id, title or file_path.stem)
+            stage_ms.update(persist_stages)
 
             self._mark_job_success(job.id, len(chunks))
-            logger.info("Ingestion complete for %s: %d chunks", file_path, len(chunks))
+            total = sum(stage_ms.values())
+            for stage, ms in stage_ms.items():
+                record(f"ingest.{stage}", ms)
+            logger.info(
+                "Ingestion complete for %s: %d chunks in %.1fs (stages ms: %s)",
+                file_path,
+                len(chunks),
+                total / 1000,
+                {k: round(v, 1) for k, v in stage_ms.items()},
+            )
             return IngestResult(
                 document_id=doc_id,
                 title=title or file_path.stem,
                 chunk_count=len(chunks),
                 job_id=job.id,
+                stage_ms={k: round(v, 1) for k, v in stage_ms.items()},
             )
         except Exception as exc:
             self._mark_job_failed(job.id, str(exc))
@@ -199,12 +220,17 @@ class IngestionPipeline:
             job.finished_at = datetime.now(UTC)
             sess.commit()
 
-    def _persist_chunks(self, chunks: list[Chunk], doc_id: str, title: str) -> None:
-        """Write chunks to PostgreSQL, then embed + index them in Qdrant + OpenSearch."""
+    def _persist_chunks(self, chunks: list[Chunk], doc_id: str, title: str) -> dict[str, float]:
+        """Write chunks to PostgreSQL, then embed + index them in Qdrant + keyword postings.
+
+        Returns per-stage timings (postgres/embed/qdrant/keyword ms) for logging
+        and GET /metrics attribution.
+        """
         from app.retrieval.bm25 import BM25Indexer
         from app.retrieval.vector import VectorStore
 
-        with session_scope() as sess:
+        stages: dict[str, float] = {}
+        with time_operation("ingest.postgres", log_on_exit=False) as t, session_scope() as sess:
             # Upsert document record.
             doc_record = sess.query(Document).filter_by(document_id=doc_id).first()
             if not doc_record:
@@ -219,10 +245,17 @@ class IngestionPipeline:
                 sess.add(doc_record)
                 sess.flush()
 
+            # Re-ingesting a document must replace its previous chunks rather
+            # than insert duplicates: chunk ids are stable per document, so a
+            # plain insert would violate the primary key on re-upload.
+            sess.query(ChunkModel).filter(ChunkModel.document_id == doc_id).delete(
+                synchronize_session=False
+            )
+
             # Chunk records.
             chunk_records = []
             for chunk in chunks:
-                record = ChunkModel(
+                chunk_record = ChunkModel(
                     id=chunk.chunk_id,
                     document_id=doc_id,
                     chunk_index=chunk.index,
@@ -232,17 +265,37 @@ class IngestionPipeline:
                     source=chunk.source,
                     content_hash=chunk.content_hash,
                 )
-                chunk_records.append(record)
+                chunk_records.append(chunk_record)
             sess.add_all(chunk_records)
             sess.commit()
+        stages["postgres"] = t.duration_ms
+
+        vector_store = VectorStore(self.settings)
+        bm25_indexer = BM25Indexer(self.settings)
+
+        if not chunks:
+            # Nothing to index, but a previous version must not stay searchable.
+            vector_store.delete_by_document(doc_id)
+            bm25_indexer.delete_by_document(doc_id)
+            return stages
 
         # Index chunks after the DB commit (don't hold DB locks during network I/O).
-        if not chunks:
-            return
         texts = [c.text for c in chunks]
-        vectors = self.embedder.embed_documents(texts)
-        VectorStore(self.settings).upsert(chunks, vectors=vectors)
-        BM25Indexer(self.settings).index_documents(chunks)
+        with time_operation("ingest.embed", log_on_exit=False) as t:
+            vectors = self.embedder.embed_documents(texts)
+        stages["embed"] = t.duration_ms
+
+        # Drop any vectors/postings left by a previous ingest of this document,
+        # so a re-upload that produces fewer chunks cannot leave orphans behind.
+        vector_store.delete_by_document(doc_id)
+        bm25_indexer.delete_by_document(doc_id)
+
+        with time_operation("ingest.qdrant", log_on_exit=False) as t:
+            vector_store.upsert(chunks, vectors=vectors)
+        stages["qdrant"] = t.duration_ms
+        with time_operation("ingest.keyword", log_on_exit=False) as t:
+            bm25_indexer.index_documents(chunks)
+        stages["keyword"] = t.duration_ms
         logger.info(
             "Indexed %d chunks: pg=%d, qdrant=%d, bm25=%d",
             len(chunks),
@@ -250,3 +303,4 @@ class IngestionPipeline:
             len(vectors),
             len(chunks),
         )
+        return stages

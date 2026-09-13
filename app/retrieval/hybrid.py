@@ -3,7 +3,7 @@
 The retrieval pipeline is:
 
 1. Embed the user query using the configured embedder.
-2. Execute vector search (Qdrant) and BM25 search (OpenSearch) in parallel.
+2. Execute vector search (Qdrant) and keyword search (Postgres tsvector) in parallel.
 3. Convert raw search results to :class:`RetrievalResult` objects.
 4. Fuse both result lists using Reciprocal Rank Fusion.
 5. Return the top ``hybrid_top_k`` results.
@@ -29,6 +29,11 @@ if TYPE_CHECKING:
     from app.embeddings.embedder import Embedder
 
 logger = logging.getLogger(__name__)
+
+# A single shared pool runs the vector + BM25 searches for every request.
+# Building a fresh 2-thread pool per query meant spawning and tearing down
+# threads on the hot path for no benefit.
+_SEARCH_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="retrieve")
 
 
 def _bm25_hit_to_result(hit: dict, rank: int) -> RetrievalResult:
@@ -83,7 +88,7 @@ class HybridRetriever:
     vector_store:
         Qdrant vector store instance.
     bm25_indexer:
-        OpenSearch BM25 indexer instance.
+        Postgres tsvector keyword indexer instance.
     """
 
     def __init__(
@@ -110,6 +115,7 @@ class HybridRetriever:
         query: str,
         top_k: int | None = None,
         filter_document_ids: list[str] | None = None,
+        exclude_document_ids: list[str] | None = None,
     ) -> list[RetrievalResult]:
         """Retrieve the best chunks for ``query`` using hybrid search.
 
@@ -122,6 +128,9 @@ class HybridRetriever:
             different batch size than the default (e.g. for reranking).
         filter_document_ids:
             Optional document_id filter passed to both retrievers.
+        exclude_document_ids:
+            Optional document_ids excluded from both retrievers (e.g. other
+            user uploads when a question is anchored on one upload).
 
         Returns
         -------
@@ -136,22 +145,23 @@ class HybridRetriever:
         # Step 1: embed the query
         query_embedding = self._embedder.embed_queries([query])[0]
 
-        # Step 2: run vector and BM25 searches
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            vec_future = executor.submit(
-                self._vector.search,
-                query_vector=query_embedding,
-                top_k=vector_top_k,
-                filter_document_ids=filter_document_ids,
-            )
-            bm25_future = executor.submit(
-                self._bm25.search,
-                query=query,
-                top_k=bm25_top_k,
-                filter_document_ids=filter_document_ids,
-            )
-            vec_hits = vec_future.result()
-            bm25_hits = bm25_future.result()
+        # Step 2: run vector and BM25 searches in parallel on the shared pool
+        vec_future = _SEARCH_POOL.submit(
+            self._vector.search,
+            query_vector=query_embedding,
+            top_k=vector_top_k,
+            filter_document_ids=filter_document_ids,
+            exclude_document_ids=exclude_document_ids,
+        )
+        bm25_future = _SEARCH_POOL.submit(
+            self._bm25.search,
+            query=query,
+            top_k=bm25_top_k,
+            filter_document_ids=filter_document_ids,
+            exclude_document_ids=exclude_document_ids,
+        )
+        vec_hits = vec_future.result()
+        bm25_hits = bm25_future.result()
 
         # Step 3: convert to RetrievalResult with rank metadata
         vec_results = [

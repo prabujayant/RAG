@@ -2,7 +2,7 @@
 
 Walks ``data/corpus`` and runs the :class:`IngestionPipeline` for every
 supported document (markdown, HTML, PDF, DOCX), which parses -> cleans ->
-chunks -> persists to PostgreSQL and indexes into Qdrant + OpenSearch.
+chunks -> persists to PostgreSQL and indexes into Qdrant + keyword postings.
 
 Usage:
     python scripts/ingest_corpus.py [--root data/corpus] [--skip-existing]
@@ -19,11 +19,10 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from sqlalchemy import select  # noqa: E402
-
 from app.db.models import Document  # noqa: E402
 from app.db.session import session_scope  # noqa: E402
 from app.ingestion.pipeline import IngestionPipeline  # noqa: E402
+from sqlalchemy import select  # noqa: E402
 
 SUPPORTED_EXTENSIONS = {".md", ".html", ".pdf", ".docx"}
 

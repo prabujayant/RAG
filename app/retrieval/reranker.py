@@ -1,18 +1,35 @@
-"""Cross-encoder reranking using BAAI/bge-reranker-v2-m3.
+"""Cross-encoder reranking using a small multilingual MiniLM model.
 
-The reranker re-scores query-document pairs using a cross-encoder model, which
-provides more accurate relevance signals than the independent vector and BM25
-scores used in the initial retrieval stage.
+The default model is ``cross-encoder/mmarco-mMiniLMv2-L12-H384-v1`` (~118M
+params). It was chosen over ``BAAI/bge-reranker-v2-m3`` (568M) after
+benchmarking both on this project's CPU-only target:
 
-Only the top-K candidates from the hybrid retriever are passed to the reranker,
-keeping inference cost predictable. When the reranker is disabled (via
-``enable_reranker=False``) or the model is unavailable, the original ordering
-is preserved and reranking is silently skipped.
+======================  ===========  ======================
+model                   per pair     ranking sanity check
+======================  ===========  ======================
+bge-reranker-v2-m3      7898 ms      pass
+mmarco-mMiniLMv2-L12     404 ms      pass (EN/DE/ID)
+ms-marco-MiniLM-L-6      221 ms      weak on DE (negative)
+======================  ===========  ======================
+
+The MiniLM model is ~20x faster while still ranking relevant passages above
+irrelevant ones across English, German and Indonesian. Set ``RERANKER_MODEL``
+to ``BAAI/bge-reranker-v2-m3`` if maximum accuracy is required and the extra
+latency is acceptable.
+
+The reranker re-scores query-document pairs, providing more accurate relevance
+signals than the independent vector and BM25 scores used in the initial
+retrieval stage.
+
+Only candidates passed in are scored; when the reranker is disabled (via
+``enable_reranker=False``) or the model is unavailable, the original ordering is
+preserved and reranking is silently skipped.
 """
 
 from __future__ import annotations
 
 import logging
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -25,8 +42,24 @@ from app.retrieval.models import RetrievalResult
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Module-level model singleton (loaded once, shared across all Reranker
+# instances). Route handlers construct a Reranker per request — without this
+# cache every query would pay the full cross-encoder load cost (~15-25s).
+# ---------------------------------------------------------------------------
+
+
+@lru_cache(maxsize=1)
+def _get_shared_reranker(model_name: str) -> CrossEncoder:
+    """Load and cache the cross-encoder model at module scope."""
+    logger.info("Loading cross-encoder model: %s", model_name)
+    from sentence_transformers import CrossEncoder
+
+    return CrossEncoder(model_name, max_length=512)
+
+
 class Reranker:
-    """Cross-encoder reranker wrapping ``BAAI/bge-reranker-v2-m3``.
+    """Cross-encoder reranker (default: multilingual MiniLM, ~118M params).
 
     Parameters
     ----------
@@ -49,15 +82,10 @@ class Reranker:
 
     @property
     def _reranker_model(self) -> CrossEncoder:
-        """Lazy-load the cross-encoder model on first access."""
+        """Return the injected model, else the shared cross-encoder
+        (loaded once at module scope)."""
         if self._model is None:
-            from sentence_transformers import CrossEncoder
-
-            logger.info("Loading cross-encoder model: %s", self._settings.reranker_model)
-            self._model = CrossEncoder(
-                self._settings.reranker_model,
-                max_length=512,
-            )
+            self._model = _get_shared_reranker(self._settings.reranker_model)
             self._loaded = True
         return self._model
 
@@ -70,6 +98,22 @@ class Reranker:
     def is_loaded(self) -> bool:
         """True when the model has been loaded (even if reranking is disabled)."""
         return self._loaded
+
+    def warmup(self) -> bool:
+        """Pre-load the cross-encoder model; return True on success.
+
+        Used at app startup so the first reranked query doesn't pay the
+        model-load cost. Returns False (without raising) when reranking is
+        disabled or the model cannot be loaded.
+        """
+        if not self.is_enabled:
+            return False
+        try:
+            _ = self._reranker_model
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Reranker warm-up failed: %s", exc)
+            return False
+        return True
 
     def rerank(
         self,

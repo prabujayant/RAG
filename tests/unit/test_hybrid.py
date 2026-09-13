@@ -41,6 +41,7 @@ class _FakeVectorStore:
         query_vector: list[float],
         top_k: int,
         filter_document_ids: list[str] | None = None,
+        exclude_document_ids: list[str] | None = None,
         score_threshold: float | None = None,
     ) -> list[dict]:
         self.search_calls.append(
@@ -48,6 +49,7 @@ class _FakeVectorStore:
                 "query_vector": query_vector,
                 "top_k": top_k,
                 "filter_document_ids": filter_document_ids,
+                "exclude_document_ids": exclude_document_ids,
                 "score_threshold": score_threshold,
             }
         )
@@ -65,10 +67,16 @@ class _FakeBM25Indexer:
         query: str,
         top_k: int,
         filter_document_ids: list[str] | None = None,
+        exclude_document_ids: list[str] | None = None,
         fields: list[str] | None = None,
     ) -> list[dict]:
         self.search_calls.append(
-            {"query": query, "top_k": top_k, "filter_document_ids": filter_document_ids}
+            {
+                "query": query,
+                "top_k": top_k,
+                "filter_document_ids": filter_document_ids,
+                "exclude_document_ids": exclude_document_ids,
+            }
         )
         return self._hits
 
@@ -217,6 +225,24 @@ class TestHybridRetriever:
         results = hybrid.retrieve("query")
         assert len(results) == 1
         assert results[0].chunk_id == "a:0"
+
+    def test_retrieve_forwards_exclude_document_ids(self) -> None:
+        """exclude_document_ids reaches both vector and BM25 searches."""
+        hybrid = HybridRetriever(
+            settings=None,
+            embedder=_FakeEmbedder(),
+            vector_store=_FakeVectorStore([
+                {"id": "a:0", "score": 0.9,
+                 "payload": {"text": "text a", "document_id": "a", "source": "a.md"}}
+            ]),
+            bm25_indexer=_FakeBM25Indexer([
+                {"id": "a:0", "score": 1.0,
+                 "payload": {"text": "text a", "document_id": "a", "source": "a.md"}}
+            ]),
+        )
+        hybrid.retrieve("query", exclude_document_ids=["other-upload"])
+        assert hybrid._vector.search_calls[0]["exclude_document_ids"] == ["other-upload"]
+        assert hybrid._bm25.search_calls[0]["exclude_document_ids"] == ["other-upload"]
 
 class TestResultConversionHelpers:
     def test_bm25_hit_to_result(self) -> None:

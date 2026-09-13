@@ -13,18 +13,18 @@ from enum import StrEnum
 class CitationStatus(StrEnum):
     """Whether a citation actually supports its associated claim."""
 
-    SUPPORTED = "supported"           # The chunk fully supports the claim.
+    SUPPORTED = "supported"  # The chunk fully supports the claim.
     PARTIALLY_SUPPORTED = "partially_supported"  # Partial overlap.
-    UNSUPPORTED = "unsupported"       # The chunk does not support the claim.
+    UNSUPPORTED = "unsupported"  # The chunk does not support the claim.
 
 
 class GroundingStatus(StrEnum):
     """Aggregate grounding result for an entire answer."""
 
-    GROUNDED = "grounded"             # Every claim is supported.
+    GROUNDED = "grounded"  # Every claim is supported.
     PARTIALLY_GROUNDED = "partially_grounded"  # At least one claim unsupported.
-    UNGROUNDED = "ungrounded"         # No claims are supported / answer is wrong.
-    REFUSED = "refused"               # Evidence was insufficient; answer refused.
+    UNGROUNDED = "ungrounded"  # No claims are supported / answer is wrong.
+    REFUSED = "refused"  # Evidence was insufficient; answer refused.
 
 
 @dataclass
@@ -43,6 +43,11 @@ class Citation:
         Page number in source, if known.
     section:
         Section heading in source, if known.
+    source:
+        Human-readable name of the document the citation came from. Surfaced so
+        the UI can show which file an answer was drawn from — without it, an
+        answer grounded in a *different* document is indistinguishable from one
+        grounded in the expected file.
     """
 
     citation_id: str
@@ -50,6 +55,7 @@ class Citation:
     text: str
     page_number: int | None = None
     section: str | None = None
+    source: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -58,6 +64,7 @@ class Citation:
             "text": self.text,
             "page_number": self.page_number,
             "section": self.section,
+            "source": self.source,
         }
 
     @classmethod
@@ -68,6 +75,7 @@ class Citation:
             text=data["text"],
             page_number=data.get("page_number"),
             section=data.get("section"),
+            source=data.get("source"),
         )
 
 
@@ -111,6 +119,45 @@ class AnswerClaim:
 
 
 @dataclass
+class TokenUsage:
+    """Tokens spent and estimated cost for the LLM calls behind an answer.
+
+    Attributes
+    ----------
+    prompt_tokens / completion_tokens:
+        Totals across all calls (generation; agent turns accumulate).
+    total_tokens:
+        Convenience sum (prompt + completion).
+    cost_usd:
+        Estimated USD cost, or None when the model is unpriced.
+    """
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    cost_usd: float | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "cost_usd": self.cost_usd,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> TokenUsage | None:
+        if not data:
+            return None
+        return cls(
+            prompt_tokens=int(data.get("prompt_tokens") or 0),
+            completion_tokens=int(data.get("completion_tokens") or 0),
+            total_tokens=int(data.get("total_tokens") or 0),
+            cost_usd=data.get("cost_usd"),
+        )
+
+
+@dataclass
 class AnswerResponse:
     """The full answer produced by the LLM, with grounding metadata.
 
@@ -133,10 +180,16 @@ class AnswerResponse:
         Whether the LLM refused to answer due to insufficient evidence.
     refused_reason:
         The LLM's stated reason for refusal, if applicable.
+    generic:
+        Whether the answer may contain general knowledge beyond the cited
+        evidence (generic mode). Generic answers are never grounded.
     total_latency_ms:
         End-to-end latency for the generation call in milliseconds.
     model:
         Which model was used to generate this answer.
+    usage:
+        Tokens spent and estimated cost behind this answer (None when the
+        LLM was never reached, e.g. retrieval found nothing).
     """
 
     answer: str
@@ -147,8 +200,10 @@ class AnswerResponse:
     confidence: float | None = None
     refused: bool = False
     refused_reason: str | None = None
+    generic: bool = False
     total_latency_ms: float | None = None
     model: str | None = None
+    usage: TokenUsage | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -160,8 +215,10 @@ class AnswerResponse:
             "confidence": self.confidence,
             "refused": self.refused,
             "refused_reason": self.refused_reason,
+            "generic": self.generic,
             "total_latency_ms": self.total_latency_ms,
             "model": self.model,
+            "usage": self.usage.to_dict() if self.usage else None,
         }
 
     @classmethod
@@ -171,12 +228,12 @@ class AnswerResponse:
             citations=[Citation.from_dict(c) for c in data.get("citations", [])],
             claims=[AnswerClaim.from_dict(c) for c in data.get("claims", [])],
             grounded=data.get("grounded", False),
-            grounding_status=GroundingStatus(
-                data.get("grounding_status", GroundingStatus.UNGROUNDED.value)
-            ),
+            grounding_status=GroundingStatus(data.get("grounding_status", GroundingStatus.UNGROUNDED.value)),
             confidence=data.get("confidence"),
             refused=data.get("refused", False),
             refused_reason=data.get("refused_reason"),
+            generic=data.get("generic", False),
             total_latency_ms=data.get("total_latency_ms"),
             model=data.get("model"),
+            usage=TokenUsage.from_dict(data.get("usage")),
         )

@@ -53,7 +53,7 @@ def fully_supported_response(sample_citations: list[Citation]) -> AnswerResponse
         confidence=0.95,
         refused=False,
         total_latency_ms=150.0,
-        model="openai/gpt-4o-mini",
+        model="nvidia/nemotron-3.5-lightning:free",
     )
 
 @pytest.fixture
@@ -67,7 +67,7 @@ def partially_supported_response(sample_citations: list[Citation]) -> AnswerResp
         confidence=0.8,
         refused=False,
         total_latency_ms=150.0,
-        model="openai/gpt-4o-mini",
+        model="nvidia/nemotron-3.5-lightning:free",
     )
 
 @pytest.fixture
@@ -80,7 +80,7 @@ def unsupported_response(sample_citations: list[Citation]) -> AnswerResponse:
         confidence=0.9,
         refused=False,
         total_latency_ms=100.0,
-        model="openai/gpt-4o-mini",
+        model="nvidia/nemotron-3.5-lightning:free",
     )
 
 @pytest.fixture
@@ -94,7 +94,7 @@ def unanswerable_response() -> AnswerResponse:
         refused=True,
         refused_reason="No supporting evidence.",
         total_latency_ms=50.0,
-        model="openai/gpt-4o-mini",
+        model="nvidia/nemotron-3.5-lightning:free",
     )
 
 @pytest.fixture
@@ -108,7 +108,7 @@ def invalid_citation_response(sample_citations: list[Citation]) -> AnswerRespons
         confidence=0.7,
         refused=False,
         total_latency_ms=100.0,
-        model="openai/gpt-4o-mini",
+        model="nvidia/nemotron-3.5-lightning:free",
     )
 
 @pytest.fixture
@@ -130,7 +130,7 @@ def ambiguous_response() -> AnswerResponse:
         confidence=0.8,
         refused=False,
         total_latency_ms=100.0,
-        model="openai/gpt-4o-mini",
+        model="nvidia/nemotron-3.5-lightning:free",
     )
 
 # ---------------------------------------------------------------------------

@@ -126,6 +126,17 @@ class TestGroundingValidatorClaimExtraction:
         assert "no citations" in result.claims[0].reason.lower()
 
 class TestGroundingValidatorStatusAggregation:
+    def test_validate_preserves_generic_flag(self) -> None:
+        """Validation keeps the generic marker on the rebuilt response."""
+        validator = GroundingValidator()
+        response = _make_response(
+            "Access tokens expire after 60 minutes [C1].",
+            [_make_citation("[C1]", "auth:0", "Access tokens expire after 60 minutes.")],
+        )
+        response.generic = True
+        result = validator.validate(response)
+        assert result.generic is True
+
     def test_all_supported_grounded(self) -> None:
         validator = GroundingValidator()
         response = _make_response(
@@ -135,6 +146,34 @@ class TestGroundingValidatorStatusAggregation:
         result = validator.validate(response)
         assert result.grounding_status == GroundingStatus.GROUNDED
         assert result.grounded is True
+
+    def test_generic_answer_is_never_fully_grounded(self) -> None:
+        """General mode may add context beyond the document, so it cannot be
+        reported as fully grounded even when every cited claim checks out."""
+        validator = GroundingValidator()
+        response = _make_response(
+            "Access tokens expire after 60 minutes [C1].",
+            [_make_citation("[C1]", "auth:0", "Access tokens expire after 60 minutes.")],
+        )
+        response.generic = True
+        result = validator.validate(response)
+
+        assert result.generic is True
+        assert result.grounded is False
+        assert result.grounding_status == GroundingStatus.PARTIALLY_GROUNDED
+
+    def test_non_generic_all_supported_still_grounded(self) -> None:
+        """The cap must not apply to strict-mode answers."""
+        validator = GroundingValidator()
+        response = _make_response(
+            "Access tokens expire after 60 minutes [C1].",
+            [_make_citation("[C1]", "auth:0", "Access tokens expire after 60 minutes.")],
+        )
+        response.generic = False
+        result = validator.validate(response)
+
+        assert result.grounded is True
+        assert result.grounding_status == GroundingStatus.GROUNDED
 
     def test_some_unsupported_partially_grounded(self) -> None:
         validator = GroundingValidator()

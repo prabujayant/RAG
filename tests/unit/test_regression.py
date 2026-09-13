@@ -7,11 +7,19 @@ from pathlib import Path
 
 import pytest
 from app.evaluation.regression import (
+    DEFAULT_PER_DIFFICULTY_THRESHOLDS,
+    DEFAULT_THRESHOLDS,
+    DEFAULT_THRESHOLDS_PATH,
+    REPO_ROOT,
+    MetricThreshold,
     RegressionEntry,
     RegressionReport,
+    ThresholdSet,
     check_regression,
     compare_baseline,
     load_baseline,
+    load_thresholds,
+    resolve_thresholds,
     save_baseline,
 )
 
@@ -213,3 +221,94 @@ class TestCheckRegression:
         }
         with pytest.raises(SystemExit):
             check_regression(current, p, verbose=False)
+
+
+class TestThresholdLoading:
+    """evals/thresholds.yaml is the single source of truth for thresholds."""
+
+    def test_loads_from_yaml(self) -> None:
+        loaded = load_thresholds()
+        names = {t.metric for t in loaded.aggregate}
+        # Aggregate metrics across the three namespaces.
+        assert "recall_at_k" in names
+        assert "citation_correctness" in names
+        # The emitted citation key is citation_completeness, not citation_recall.
+        assert "citation_completeness" in names
+        assert {t.metric for t in loaded.per_difficulty} == {
+            "recall_at_k",
+            "hit_rate",
+            "citation_correctness",
+        }
+
+    def test_per_difficulty_tolerance_is_distinct(self) -> None:
+        """Per-difficulty recall tolerates more drift than the aggregate metric."""
+        loaded = load_thresholds()
+        assert loaded.find("aggregate", "recall_at_k").tolerance == 0.05
+        assert loaded.find("per_difficulty", "recall_at_k").tolerance == 0.10
+
+    def test_fallback_matches_yaml_metric_names(self) -> None:
+        """Drift guard: the built-in fallback must track the YAML."""
+        loaded = load_thresholds()
+        assert {t.metric for t in loaded.aggregate} == {t.metric for t in DEFAULT_THRESHOLDS}
+        assert {t.metric for t in loaded.per_difficulty} == {
+            t.metric for t in DEFAULT_PER_DIFFICULTY_THRESHOLDS
+        }
+
+    def test_fallback_matches_yaml_values(self) -> None:
+        """Drift guard: fallback values must equal the authoritative YAML values."""
+        loaded = load_thresholds()
+        as_pairs = lambda ts: sorted((t.metric, t.minimum, t.tolerance) for t in ts)  # noqa: E731
+        assert as_pairs(loaded.aggregate) == as_pairs(DEFAULT_THRESHOLDS)
+        assert as_pairs(loaded.per_difficulty) == as_pairs(DEFAULT_PER_DIFFICULTY_THRESHOLDS)
+
+    def test_missing_file_falls_back(self, tmp_path: Path) -> None:
+        loaded = load_thresholds(tmp_path / "nope.yaml")
+        assert {t.metric for t in loaded.aggregate} == {t.metric for t in DEFAULT_THRESHOLDS}
+
+    def test_thresholds_path_points_at_evals(self) -> None:
+        assert DEFAULT_THRESHOLDS_PATH == REPO_ROOT / "evals" / "thresholds.yaml"
+        assert DEFAULT_THRESHOLDS_PATH.exists(), "thresholds.yaml must be committed"
+
+    def test_resolve_accepts_plain_list(self) -> None:
+        """Back-compat: callers passing an explicit list still work."""
+        custom = [MetricThreshold("recall_at_k", minimum=0.10, tolerance=0.05)]
+        resolved = resolve_thresholds(custom)
+        assert isinstance(resolved, ThresholdSet)
+        assert resolved.aggregate == custom
+        assert resolved.per_difficulty == []
+
+    def test_resolve_none_loads_yaml(self) -> None:
+        resolved = resolve_thresholds(None)
+        assert resolved.aggregate, "expected thresholds loaded from YAML"
+
+
+class TestRecordedBaselinePassesGate:
+    """The shipped baseline must satisfy the shipped thresholds.
+
+    Without this, wiring thresholds.yaml into the gate could fail immediately and
+    permanently — a threshold far above what the pipeline actually achieves.
+    """
+
+    def test_baseline_has_no_regression_against_itself(self) -> None:
+        baseline_path = REPO_ROOT / "evals" / "baselines" / "baseline.json"
+        assert baseline_path.exists(), "baseline.json must be committed"
+        baseline = load_baseline(baseline_path)
+        report = compare_baseline(baseline, baseline)
+        assert report.regressed_metrics == 0, report.summary()
+
+    def test_baseline_meets_every_aggregate_minimum(self) -> None:
+        baseline_path = REPO_ROOT / "evals" / "baselines" / "baseline.json"
+        baseline = load_baseline(baseline_path)
+        namespaces = [
+            baseline.get("aggregate_retrieval", {}),
+            baseline.get("aggregate_citation", {}),
+            baseline.get("aggregate_ragas", {}),
+        ]
+        for threshold in load_thresholds().aggregate:
+            for ns in namespaces:
+                if threshold.metric in ns:
+                    assert ns[threshold.metric] >= threshold.minimum, (
+                        f"{threshold.metric}={ns[threshold.metric]} < minimum "
+                        f"{threshold.minimum}; raise the baseline or lower the floor"
+                    )
+                    break

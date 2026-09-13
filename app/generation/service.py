@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from app.config import get_settings
@@ -16,7 +17,10 @@ from app.generation.schemas import (
     AnswerResponse,
     Citation,
     GroundingStatus,
+    TokenUsage,
 )
+from app.observability.metrics import count as count_metric
+from app.safety import drop_tainted_chunks, redact_pii
 
 if TYPE_CHECKING:
     from app.retrieval.models import RetrievalResult
@@ -27,32 +31,135 @@ logger = logging.getLogger(__name__)
 # JSON extraction helpers
 # ---------------------------------------------------------------------------
 
-_JSON_CODE_FENCE_RE = re.compile(
-    r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE
-)
-_JSON_BRACES_RE = re.compile(r"\{.*\}", re.DOTALL)
+_JSON_CODE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
 
 
-def extract_json(raw_text: str) -> str | None:
-    """Extract the first JSON object from *raw_text*.
+def extract_json(raw_text: str | None) -> str | None:
+    """Extract the JSON object from *raw_text*.
 
     Handles:
-    - Bare JSON: ``{...}``
-    - Markdown code fences: `````json\n{...}\n``` ``
+    - Bare JSON (the whole response, as produced in JSON mode)
+    - Markdown code fences
     - Extra text before/after the JSON block
     - Malformed JSON (returns None so caller can fall back to refusal)
     """
-    # Try fenced JSON first
-    match = _JSON_CODE_FENCE_RE.search(raw_text)
-    if match:
-        return match.group(1).strip()
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        return None
 
-    # Try bare JSON object
-    match = _JSON_BRACES_RE.search(raw_text)
-    if match:
-        return match.group(0).strip()
+    text = raw_text.strip()
+
+    # Fast path: the whole response is a JSON object (the JSON-mode case).
+    if text.startswith("{") and safe_parse_json(text) is not None:
+        return text
+
+    # Try candidates back-to-front: reasoning models emit a chain-of-thought
+    # preamble (which may itself contain braces) *before* the real payload.
+    for candidate in reversed(_iter_json_candidates(text)):
+        if safe_parse_json(candidate) is not None:
+            return candidate
+
+    # Final fallback: the response may have been cut off mid-JSON because the
+    # model hit max_tokens (finish_reason="length"). A truncated object never
+    # closes its braces, so it yields no candidate above; repair it instead of
+    # discarding an otherwise usable answer.
+    start = text.find("{")
+    if start != -1:
+        repaired = _repair_truncated_json(text[start:])
+        if repaired is not None and safe_parse_json(repaired) is not None:
+            return repaired
 
     return None
+
+
+def _repair_truncated_json(text: str) -> str | None:
+    """Best-effort repair of a JSON object truncated mid-value.
+
+    Closes an unterminated string and appends the missing container closers so
+    a response cut off by ``max_tokens`` can still be parsed. Returns ``None``
+    when the fragment cannot be repaired. The recovered text is intentionally
+    partial — the caller treats it as the model's answer.
+    """
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            stack.append("}")
+        elif ch == "[":
+            stack.append("]")
+        elif ch in "}]":
+            if stack and stack[-1] == ch:
+                stack.pop()
+            else:
+                return None  # structurally broken, not merely truncated
+
+    if not stack and not in_string:
+        return text
+
+    repaired = text
+    if in_string:
+        repaired += '"'
+    repaired = repaired.rstrip()
+    if repaired.endswith(","):
+        repaired = repaired[:-1]
+    repaired += "".join(reversed(stack))
+
+    try:
+        json.loads(repaired)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return repaired
+
+
+def _iter_json_candidates(text: str) -> list[str]:
+    """Return brace/fence-delimited JSON candidates from *text*, in order.
+
+    Braces inside string literals are ignored so quoted text such as
+    ``"answer": "use {braces}"`` cannot corrupt the depth tracking.
+    """
+    candidates: list[str] = []
+
+    # 1. Markdown code fences.
+    candidates.extend(m.group(1).strip() for m in _JSON_CODE_FENCE_RE.finditer(text))
+
+    # 2. Top-level brace-balanced spans.
+    depth = 0
+    start: int | None = None
+    in_string = False
+    escaped = False
+    for idx, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            if depth == 0:
+                start = idx
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start is not None:
+                candidates.append(text[start : idx + 1].strip())
+                start = None
+
+    return candidates
 
 
 def safe_parse_json(raw: str) -> dict | None:
@@ -66,6 +173,26 @@ def safe_parse_json(raw: str) -> dict | None:
 # ---------------------------------------------------------------------------
 # Citation validation helpers
 # ---------------------------------------------------------------------------
+
+_CITATION_MARKER_RE = re.compile(r"\[C(\d+)\]", re.IGNORECASE)
+
+
+def _coerce_citations(raw: object) -> list[dict]:
+    """Normalize the model's ``citations`` field into a list of dicts.
+
+    Models sometimes emit a bare string (``"[C1]"`` or ``"[C1], [C2]"``) or a
+    single object instead of the documented list of citation objects. Iterating
+    over a string would yield individual characters, so anything that is not a
+    list of objects is normalized here.
+    """
+    if isinstance(raw, dict):
+        return [raw]
+    if isinstance(raw, str):
+        return [{"citation_id": match.group(0)} for match in _CITATION_MARKER_RE.finditer(raw)]
+    if isinstance(raw, list):
+        return [item for item in raw if isinstance(item, dict)]
+    return []
+
 
 def _normalize_citation_id(cid: str) -> str:
     """Strip whitespace and normalize a citation ID to [C{n}] form."""
@@ -114,26 +241,10 @@ def _candidate_for_citation_id(
     return candidates[idx]
 
 
-def _find_chunk_id_for_citation(
-    citation_id: str, candidates: list[RetrievalResult]
-) -> str | None:
-    """Map a citation_id like [C1] to the corresponding chunk_id."""
-    # citation_id is like "[C1]" — map to index
-    stripped = citation_id.strip("[]C")
-    try:
-        idx = int(stripped) - 1
-    except ValueError:
-        return None
-
-    if idx < 0 or idx >= len(candidates):
-        return None
-
-    return candidates[idx].chunk_id
-
-
 # ---------------------------------------------------------------------------
 # Main service
 # ---------------------------------------------------------------------------
+
 
 class GenerationService:
     """Service that converts a question + evidence into a grounded answer.
@@ -168,6 +279,7 @@ class GenerationService:
         candidates: list[RetrievalResult],
         *,
         temperature: float | None = None,
+        allow_generic: bool = False,
     ) -> AnswerResponse:
         """Generate a grounded answer from the question and retrieved evidence.
 
@@ -179,6 +291,10 @@ class GenerationService:
             Evidence chunks from the retrieval pipeline.
         temperature:
             Override the model's sampling temperature.
+        allow_generic:
+            When True, the model may answer from general knowledge where the
+            evidence is thin instead of refusing. The response is flagged
+            ``generic=True`` and is never reported as grounded.
 
         Returns
         -------
@@ -187,8 +303,15 @@ class GenerationService:
         """
         start = time.perf_counter()
 
+        # Step 0: safety — drop evidence carrying instruction-takeover
+        # payloads so tainted text never reaches the model prompt. An empty
+        # remainder flows into the normal no-evidence refusal below.
+        candidates, dropped = drop_tainted_chunks(candidates)
+        if dropped:
+            count_metric("safety.chunks_dropped", dropped)
+
         # Step 1: build prompts
-        system_prompt, user_prompt = build_prompts(question, candidates)
+        system_prompt, user_prompt = build_prompts(question, candidates, allow_generic=allow_generic)
 
         # Step 2: call LLM
         try:
@@ -212,8 +335,11 @@ class GenerationService:
         json_str = extract_json(raw_text)
         data = safe_parse_json(json_str) if json_str else None
 
-        if data is None:
-            logger.warning("Failed to parse JSON from LLM response: %s", raw_text[:200])
+        if not isinstance(data, dict):
+            logger.warning(
+                "Failed to parse JSON object from LLM response: %r",
+                (raw_text or "")[:200],
+            )
             return self._build_error_response(
                 "Failed to parse model output as JSON.",
                 start=start,
@@ -237,10 +363,32 @@ class GenerationService:
         refused_reason = data.get("refused_reason")
         confidence = self._normalize_confidence(data.get("confidence"))
 
+        # Step 5b: safety — mask PII in the answer and citation excerpts
+        # before anything is returned. Grounding validation (a later stage)
+        # runs on the same masked text, so scores stay consistent.
+        answer, redacted = redact_pii(answer)
+        if refused_reason:
+            refused_reason, n = redact_pii(refused_reason)
+            redacted += n
+        for citation in citations:
+            citation.text, n = redact_pii(citation.text)
+            redacted += n
+        if redacted:
+            count_metric("safety.pii_redacted", redacted)
+
         # Step 6: compute grounding status
         grounding_status = self._compute_grounding_status(refused, citations)
 
         latency_ms = (time.perf_counter() - start) * 1000
+
+        call_usage = response.usage
+        usage = TokenUsage(
+            prompt_tokens=call_usage.prompt_tokens or 0,
+            completion_tokens=call_usage.completion_tokens or 0,
+            total_tokens=call_usage.total_tokens
+            or (call_usage.prompt_tokens or 0) + (call_usage.completion_tokens or 0),
+            cost_usd=call_usage.cost_usd,
+        )
 
         return AnswerResponse(
             answer=answer,
@@ -251,8 +399,10 @@ class GenerationService:
             confidence=confidence,
             refused=refused,
             refused_reason=refused_reason,
+            generic=allow_generic and not refused,
             total_latency_ms=latency_ms,
             model=response.model,
+            usage=usage,
         )
 
     # -----------------------------------------------------------------------
@@ -275,12 +425,17 @@ class GenerationService:
         ``chunk_id`` and ``text`` byte-for-byte. This makes grounding robust to
         models that truncate, rephrase, or omit the text/chunk fields.
         """
-        raw_citations: list[dict] = data.get("citations") or []
+        raw_citations = _coerce_citations(data.get("citations"))
         citations: list[Citation] = []
+        # A citation id maps 1:1 to a candidate, so a repeated marker (the model
+        # often echoes the same [C1] several times) is always redundant. Keeping
+        # duplicates produced two entries with the same citation_id, which the
+        # UI renders as duplicate rows and React rejects as duplicate keys.
+        seen_citation_ids: set[str] = set()
 
         for c in raw_citations:
             try:
-                citation_id = _normalize_citation_id(c.get("citation_id", ""))
+                citation_id = _normalize_citation_id(c.get("citation_id") or "")
             except (TypeError, ValueError):
                 continue  # skip malformed entries
 
@@ -292,6 +447,11 @@ class GenerationService:
                     valid_citation_ids,
                 )
                 continue
+
+            if citation_id in seen_citation_ids:
+                logger.debug("Dropping duplicate citation %r", citation_id)
+                continue
+            seen_citation_ids.add(citation_id)
 
             # Map [C{i}] -> candidates[i - 1] to get the authoritative chunk.
             candidate = _candidate_for_citation_id(citation_id, candidates)
@@ -305,6 +465,15 @@ class GenerationService:
                     text=candidate.text,
                     page_number=candidate.page_number,
                     section=candidate.section,
+                    # Bare file name so the UI can show which document the
+                    # answer actually came from. The 8-hex prefix is added when
+                    # an upload collides with an existing file name; strip it
+                    # for display so the user sees the original name.
+                    source=(
+                        re.sub(r"^[0-9a-f]{8}_", "", Path(candidate.source).name)
+                        if candidate.source
+                        else None
+                    ),
                 )
             )
 

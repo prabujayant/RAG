@@ -8,7 +8,6 @@ Usage::
 
 Environment variables (from Settings):
     OPENROUTER_API_KEY   — required for Ragas evaluation
-    OPENSEARCH_URL       — defaults to http://localhost:9200
     QDRANT_URL           — defaults to http://localhost:6333
     EVAL_DATASET_PATH    — defaults to evals/dataset/golden.jsonl
 """

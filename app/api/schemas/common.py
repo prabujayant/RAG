@@ -25,7 +25,7 @@ class ComponentStatus(StrEnum):
 
 
 class DependencyStatus(BaseModel):
-    """Status of a single dependency (e.g. PostgreSQL, Qdrant, OpenSearch)."""
+    """Status of a single dependency (e.g. PostgreSQL, Qdrant, keyword search)."""
 
     name: str = Field(description="Human-readable component name")
     status: ComponentStatus = Field(description="Current component status")
