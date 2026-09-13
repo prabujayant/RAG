@@ -150,20 +150,29 @@ def query(
     # Step 2: cross-encoder reranking (non-fatal — falls back to hybrid order).
     # Honors ENABLE_RERANKER / RERANK_TOP_K; the Reranker itself degrades
     # gracefully when disabled or when the model is unavailable.
-    try:
-        reranker = Reranker(settings=settings)
-        with time_operation("query.rerank", log_on_exit=False) as t:
-            candidates = reranker.rerank(
-                query=request.question,
-                candidates=candidates,
+    #
+    # Optimization: when hybrid retrieval returns only a few high-precision
+    # candidates (typical of anchored questions about a small upload), the
+    # cross-encoder adds latency without changing order. Skip it below a small
+    # threshold — this is the dominant cost on small candidate sets.
+    MIN_CANDIDATES_FOR_RERANK = 4
+    if len(candidates) >= MIN_CANDIDATES_FOR_RERANK:
+        try:
+            reranker = Reranker(settings=settings)
+            with time_operation("query.rerank", log_on_exit=False) as t:
+                candidates = reranker.rerank(
+                    query=request.question,
+                    candidates=candidates,
+                )
+            stage_ms["rerank"] = t.duration_ms
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Reranking failed for request %s, using hybrid order: %s",
+                request_id,
+                exc,
             )
-        stage_ms["rerank"] = t.duration_ms
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "Reranking failed for request %s, using hybrid order: %s",
-            request_id,
-            exc,
-        )
+    else:
+        stage_ms["rerank"] = 0.0
 
     # Step 3: evidence selection (non-fatal — falls back to reranked list).
     # Enforces FINAL_CONTEXT_K / MAX_CONTEXT_TOKENS so generation always sees
