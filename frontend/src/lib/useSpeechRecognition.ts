@@ -104,6 +104,14 @@ export function useSpeechRecognition({
   // True while the user wants to be listening, so `onend` can auto-restart
   // (Chrome ends the session after a pause even with continuous = true).
   const wantListeningRef = useRef(false);
+  // Set when a failure is not recoverable by restarting. Without this, `onend`
+  // restarts after every error and the recogniser spins in a silent loop: the
+  // UI keeps saying "Listening…" while no audio is ever transcribed and the
+  // real error never surfaces. Cleared on each start().
+  const fatalErrorRef = useRef(false);
+  // Guards against a tight restart loop when the recogniser ends immediately.
+  const restartCountRef = useRef(0);
+  const lastRestartRef = useRef(0);
 
   useEffect(() => {
     onTranscriptRef.current = onTranscript;
@@ -148,37 +156,68 @@ export function useSpeechRecognition({
       switch (event.error) {
         case "not-allowed":
         case "service-not-allowed":
+          fatalErrorRef.current = true;
           setPermissionDenied(true);
           setError(
-            "Microphone access was blocked. If this app is embedded in a page, open it directly and allow the microphone."
+            "Microphone access was blocked. Allow the microphone for this site, and if the app is embedded in another page, open it directly."
           );
           break;
         case "no-speech":
+          // Recoverable: the user simply did not speak. Let onend restart.
           setError("No speech detected — try again.");
           break;
         case "audio-capture":
-          setError("No microphone was found.");
+          fatalErrorRef.current = true;
+          setError("No microphone was found. Check that one is connected and enabled.");
           break;
         case "network":
-          setError("Speech recognition needs a network connection.");
+          // Chrome's recogniser talks to Google's speech service. If that is
+          // unreachable (offline, blocked, or unreachable region) recognition
+          // cannot work — restarting only loops silently, so stop retrying.
+          fatalErrorRef.current = true;
+          setError(
+            "Speech recognition could not reach the browser's speech service. Check your connection, or type your question instead."
+          );
           break;
         case "aborted":
           // Fired by our own stop(); not an error worth showing.
           break;
+        case "language-not-supported":
+          fatalErrorRef.current = true;
+          setError("Speech recognition does not support this language.");
+          break;
         default:
+          fatalErrorRef.current = true;
           setError(`Speech recognition error: ${event.error}`);
       }
     };
 
     recognition.onend = () => {
       setInterim("");
-      if (wantListeningRef.current) {
-        // Restart seamlessly so a pause doesn't end the session.
-        try {
-          recognition.start();
-          return;
-        } catch {
-          // start() throws if already started; fall through to stopped state.
+      // Never auto-restart after a fatal error, and never restart in a tight
+      // loop: if sessions keep ending within a second of starting, back off.
+      if (wantListeningRef.current && !fatalErrorRef.current) {
+        const now = Date.now();
+        if (now - lastRestartRef.current < 1000) {
+          restartCountRef.current += 1;
+        } else {
+          restartCountRef.current = 0;
+        }
+        lastRestartRef.current = now;
+
+        if (restartCountRef.current < 3) {
+          try {
+            recognition.start();
+            return;
+          } catch {
+            // start() throws if already started; fall through to stopped state.
+          }
+        } else {
+          // Repeated immediate restarts mean the recogniser cannot run here.
+          wantListeningRef.current = false;
+          setError(
+            "Speech recognition keeps stopping immediately and cannot be used here. Please type your question instead."
+          );
         }
       }
       setListening(false);
@@ -206,6 +245,11 @@ export function useSpeechRecognition({
     if (!recognition) return;
     setError(null);
     setPermissionDenied(false);
+    // A fresh user action clears any previous fatal state so the user can
+    // retry after fixing the cause (e.g. granting the microphone).
+    fatalErrorRef.current = false;
+    restartCountRef.current = 0;
+    lastRestartRef.current = 0;
     wantListeningRef.current = true;
     try {
       recognition.start();
