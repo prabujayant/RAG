@@ -242,3 +242,16 @@ Four benchmark experiments (vector-only / BM25-only / hybrid / final grounded sy
 
 - **Included**: everything in spec §45 Definition of Done
 - **Excluded**: Kubernetes/Terraform/cloud infra, authentication system, notebook/Streamlit UI, LangChain in app code
+
+## Close-out addendum (2026-09) — build complete, follow-ups archived
+
+Phases 0–14 above are done and verified (488 unit tests green; `/health`, `/ready`, live queries proven). Post-plan additions, all live and tested:
+
+- **Tool-use agent** (`app/generation/agent.py`, `POST /query/agent`): ReAct loop with `search_documents`/`fetch_chunk` function calling on nex-n2.5-mini, same grounding contract + tool trace. Check: `python scripts/agent_smoke.py`.
+- **Cost observability** (`app/observability/cost.py`): per-call token/cost recording, `/metrics` → `llm_usage` totals, per-answer `usage` block, cumulative header pill in the UI.
+- **Safety screening** (`app/safety/`): question gate, evidence filter, PII redaction on all three query paths; counters in `/metrics`; red-team battery `tests/unit/test_safety.py`, proven against uploaded attack docs.
+- **Evidence diversity**: greedy diversity-adjusted selection (was dead code); `evals/thresholds.yaml` is the single threshold source with sync tests.
+- **Shared-corpus toggle**: UI opt-in (default OFF); anchored so other uploads stay excluded.
+- **`LLM_REASONING_EFFORT`** setting: `medium` measured ≈23% faster generation, equal quality on n=2 — too thin to flip; default stays `high`. Re-run a larger comparison before changing.
+
+Deliberately **not** built (poor fit, documented): multi-agent orchestration, embedding-model fine-tuning, live A/B traffic splitting, K8s manifests. OpenSearch fully removed (dep, settings, scripts, volumes).

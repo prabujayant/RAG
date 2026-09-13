@@ -1,11 +1,26 @@
-# AskMyDocs infrastructure: PostgreSQL (metadata), Qdrant (vectors),
-# OpenSearch (BM25). The FastAPI app may run locally or via a separate image.
+# AskMyDocs infrastructure: PostgreSQL (metadata + tsvector keyword search),
+# Qdrant (vectors), Redis (Celery). OpenSearch was removed — keyword search
+# now lives in Postgres (keyword_postings). The FastAPI app may run locally
+# or via a separate image.
 #
 # Start dependencies:   docker compose up -d
 # Stop / reset:         docker compose down -v
-# OpenSearch single-node runs with the demo security configuration.
 
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: askmydocs-redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   postgres:
     image: postgres:16-alpine
     container_name: askmydocs-postgres
@@ -38,27 +53,7 @@ services:
       timeout: 5s
       retries: 10
 
-  opensearch:
-    image: opensearchproject/opensearch:2.19.0
-    container_name: askmydocs-opensearch
-    environment:
-      # Single-node, demo security (admin/admin). Not for production.
-      discovery.type: single-node
-      DISABLE_SECURITY_PLUGIN: "true"
-      DISABLE_INSTALL_DEMO_CONFIG: "true"
-      OPENSEARCH_INITIAL_ADMIN_PASSWORD: "Admin123!"
-      bootstrap.memory_lock: "true"
-    ulimits:
-      memlock:
-        soft: -1
-        hard: -1
-    ports:
-      - "9200:9200"
-      - "9600:9600"
-    volumes:
-      - opensearch_data:/usr/share/opensearch/data
-
 volumes:
+  redis_data:
   postgres_data:
   qdrant_data:
-  opensearch_data:
