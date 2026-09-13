@@ -26,7 +26,7 @@ on:
   workflow_dispatch:
 
 env:
-  SPACE_URL: https://prabu17-rvce.hf.space
+  SPACE_URL: https://prabu17-askmydocs.hf.space
 
 concurrency:
   group: keep-warm
