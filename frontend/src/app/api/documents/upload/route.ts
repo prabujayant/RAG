@@ -2,6 +2,8 @@ export const dynamic = "force-dynamic";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
 
+import { waitForBackendReady } from "@/lib/backendReady";
+
 /**
  * Proxy for document upload. Forwards the multipart body to the backend's
  * POST /documents/upload. Pass ?background=true to enqueue on the Celery
@@ -10,6 +12,9 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
  */
 export async function POST(request: Request) {
   try {
+    // Backend may still be cold-starting after a Space restart/redeploy; wait
+    // for it before forwarding so we don't insta-502 the user.
+    await waitForBackendReady(API_BASE);
     const incoming = await request.formData();
     const file = incoming.get("file");
 

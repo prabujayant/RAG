@@ -2,6 +2,8 @@ export const dynamic = "force-dynamic";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
 
+import { waitForBackendReady } from "@/lib/backendReady";
+
 /**
  * SSE passthrough: POST /api/query/stream -> backend POST /query/stream.
  * Streams backend events (retrieval -> reranking -> generation -> done)
@@ -10,6 +12,10 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
 export async function POST(request: Request) {
   try {
     const body = await request.json();
+
+    // Backend may still be cold-starting after a restart/redeploy; wait for it
+    // before opening the SSE connection so the browser doesn't see an error.
+    await waitForBackendReady(API_BASE);
 
     const backendRes = await fetch(`${API_BASE}/query/stream`, {
       method: "POST",
