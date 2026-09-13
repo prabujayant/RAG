@@ -114,10 +114,12 @@ class Settings(BaseSettings):
     openrouter_model: str = Field(default="nex-agi/nex-n2.5-mini:free")
     openrouter_base_url: str = Field(default="https://openrouter.ai/api/v1")
     llm_timeout_seconds: float = Field(
-        default=60.0,
+        default=180.0,
         description=(
-            "HTTP timeout for LLM calls. Raise this if you switch to a "
-            "reasoning model, which can spend 60s+ thinking before answering."
+            "HTTP timeout for LLM calls. Must exceed the time needed to emit "
+            "MAX_ANSWER_TOKENS: a reasoning model producing ~16k tokens can "
+            "take well over a minute. Was 60s, which risked timing out before "
+            "a long answer finished."
         ),
     )
     llm_max_retries: int = Field(default=2)
@@ -143,12 +145,12 @@ class Settings(BaseSettings):
 
     # ---- Grounding / answers ----------------------------------------------------
     max_answer_tokens: int = Field(
-        default=8192,
+        default=16384,
         description=(
             "Max completion tokens for answer generation. Must cover the "
             "model's reasoning tokens (if any) plus the JSON answer, or the "
-            "response is truncated mid-JSON and cannot be parsed. Raise this "
-            "if you switch to a reasoning model."
+            "response is truncated mid-JSON and cannot be parsed. Raised from "
+            "8192 after observing finish_reason=length truncation in production."
         ),
     )
     confidence_threshold: float = Field(default=0.5)
