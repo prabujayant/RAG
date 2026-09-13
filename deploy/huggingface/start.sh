@@ -197,8 +197,14 @@ PY
 chunk_count="${chunk_count:-0}"
 
 if [ "$INGEST_CORPUS" = "true" ] && [ "$chunk_count" -eq 0 ] && [ -d "data/corpus" ]; then
-  log "corpus empty — ingesting data/corpus (may take several minutes on CPU)"
-  python scripts/ingest_corpus.py --root data/corpus || warn "corpus ingest failed"
+  # Ingest at the LOWEST CPU priority. On free cpu-basic (2 vCPU) a full corpus
+  # ingest takes ~20+ min and would otherwise starve interactive work: user
+  # uploads (queued on the Celery worker) sat there for 5+ minutes with the UI
+  # stuck on "Parsing, embedding and indexing...". With `nice`, uploads and
+  # queries always win; the corpus still finishes, just in the background.
+  log "corpus empty — ingesting data/corpus at low priority (may take 20+ min on CPU)"
+  nice -n 19 python scripts/ingest_corpus.py --root data/corpus \
+    || warn "corpus ingest failed"
 else
   log "skipping corpus ingest (chunks=$chunk_count)"
 fi
