@@ -58,7 +58,12 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -e ".[dev]"
-          pip install pytest pytest-asyncio pytest-cov pytest-timeout pytest-github-actions-verbose-output
+          # NOTE: the real package is `pytest-github-actions-annotate-failures`.
+          # `pytest-github-actions-verbose-output` was a typo that has never
+          # existed on PyPI, so this step failed and took down every CI job
+          # (lint, typecheck, unit tests) — which in turn blocked the deploy
+          # stage, since it `needs` the test jobs.
+          pip install pytest pytest-asyncio pytest-cov pytest-timeout pytest-github-actions-annotate-failures
 
       - name: Verify installation
         run: pip show ruff mypy pytest

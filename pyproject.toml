@@ -37,18 +37,6 @@ dependencies = [
     # Observability
     "langfuse>=2.42",
 
-    # Evaluation
-    # `RagasEvaluator` is written against the ragas 0.4 API: the module-level
-    # `evaluate()` plus `ragas.llms.LangchainLLMWrapper` /
-    # `ragas.embeddings.LangchainEmbeddingsWrapper` (ragas 0.4 dropped the
-    # `Evaluator` class). Pin to 0.4.x so a fresh install matches the code.
-    # ragas 0.2.x also imports `langchain_community.chat_models.vertexai`,
-    # removed in langchain-community 0.4, hence the upper bound there.
-    "ragas>=0.4,<0.5",
-    "langchain-community<0.4",
-    "numpy>=1.26",
-    "pandas>=2.2",
-
     # Utility
     "python-dotenv>=1.0",
     "tenacity>=8.3",
@@ -61,6 +49,26 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# NOTE: ragas is deliberately NOT a runtime dependency. It is imported lazily
+# inside `RagasEvaluator._initialize()` and degrades gracefully to "skipped"
+# when absent, so the served app never needs it. Keeping it here instead of the
+# base list matters for the HF Space: ragas 0.4 drags in langchain, langsmith,
+# langgraph, datasets, pyarrow, scipy and scikit-learn, which added enough image
+# weight to get the free cpu-basic build OOMKilled (exit 137) while pushing.
+# Install with `pip install -e ".[eval]"` to run evaluations.
+eval = [
+    # `RagasEvaluator` is written against the ragas 0.4 API: the module-level
+    # `evaluate()` plus `ragas.llms.LangchainLLMWrapper` /
+    # `ragas.embeddings.LangchainEmbeddingsWrapper` (ragas 0.4 dropped the
+    # `Evaluator` class). Pin to 0.4.x so a fresh install matches the code.
+    # ragas 0.2.x also imports `langchain_community.chat_models.vertexai`,
+    # removed in langchain-community 0.4, hence the upper bound there.
+    "ragas>=0.4,<0.5",
+    "langchain-community<0.4",
+    "numpy>=1.26",
+    "pandas>=2.2",
+]
+
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -70,6 +78,7 @@ dev = [
     "mypy>=1.9",
     "types-requests>=2.31",
     "aiosqlite>=0.20",
+    "askmydocs[eval]",
 ]
 
 [build-system]

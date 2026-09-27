@@ -10,22 +10,24 @@ from fastapi.testclient import TestClient
 
 @pytest.mark.unit
 def test_try_enqueue_success() -> None:
+    import app.tasks.ingestion as tasks_mod
+    from app.api.routes import documents as docs_mod
     from app.api.routes.documents import _try_enqueue_ingest
 
-    with patch(
-        "app.tasks.ingestion.ingest_document_job", create=True
-    ) as _unused:
-        # Patch where it is imported inside the helper (app.tasks.ingestion).
-        import app.tasks.ingestion as tasks_mod
-
-        mock_task = MagicMock()
-        orig = tasks_mod.ingest_document_job
-        tasks_mod.ingest_document_job = mock_task
-        try:
-            assert _try_enqueue_ingest("d", "/tmp/f.md", "t", "j") is True
-            mock_task.delay.assert_called_once_with("d", "/tmp/f.md", "t", "j")
-        finally:
-            tasks_mod.ingest_document_job = orig
+    # A reachable broker is not a running worker, so the helper first probes for
+    # a live worker. Patch that gate, then patch where the task itself is
+    # imported inside the helper (app.tasks.ingestion).
+    mock_task = MagicMock()
+    orig_task = tasks_mod.ingest_document_job
+    orig_avail = docs_mod._celery_worker_available
+    tasks_mod.ingest_document_job = mock_task
+    docs_mod._celery_worker_available = lambda *a, **k: True
+    try:
+        assert _try_enqueue_ingest("d", "/tmp/f.md", "t", "j") is True
+        mock_task.delay.assert_called_once_with("d", "/tmp/f.md", "t", "j")
+    finally:
+        tasks_mod.ingest_document_job = orig_task
+        docs_mod._celery_worker_available = orig_avail
 
 
 @pytest.mark.unit
