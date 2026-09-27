@@ -30,6 +30,37 @@ COPY frontend/ ./
 # the final image (`next` itself is a runtime dependency).
 RUN npm run build && npm prune --omit=dev
 
+FROM python:3.12-slim-bookworm AS python-builder
+
+# Build-only toolchain, present solely so an sdist fallback can compile if some
+# dependency has no manylinux wheel. Never copied into the final image.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# torch MUST come from the CPU-only index. The default PyPI linux wheel pulls
+# the whole CUDA stack (nvidia-cublas, cudnn, nccl, ...) — roughly 3-5 GB of
+# libraries a CPU-only Space can never use.
+#
+# Both installs go to the same --prefix. PYTHONPATH is what makes this correct:
+# a --prefix install lands outside site-packages, so without it on PYTHONPATH
+# the second command would not see the CPU torch already present, would
+# re-resolve `torch>=2.2` against the default index, and pull the CUDA build
+# into /out anyway — silently reinstating the OOM.
+ENV PYTHONPATH=/out/lib/python3.12/site-packages
+
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir --prefix=/out \
+        --index-url https://download.pytorch.org/whl/cpu "torch>=2.2"
+
+COPY pyproject.toml README.md ./
+# With the CPU torch already visible, this resolves `torch>=2.2` against it and
+# installs only the remaining project deps. build-essential, the pip cache and
+# the index metadata never leave this stage.
+RUN pip install --no-cache-dir --prefix=/out .
+
 FROM python:3.12-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -47,6 +78,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # ---------------------------------------------------------------------------
 # System packages: PostgreSQL 16, Redis, Caddy, and Qdrant runtime deps.
+#
+# No `build-essential` here on purpose. It is only needed to compile sdist
+# fallbacks during pip install, so it lives in the python-builder stage above
+# and never reaches this image (it is ~200 MB on its own).
 # ---------------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
         postgresql \
@@ -54,7 +89,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         caddy \
         curl \
         ca-certificates \
-        build-essential \
         libgomp1 \
         zstd \
     && rm -rf /var/lib/apt/lists/*
@@ -70,12 +104,12 @@ RUN curl -fsSL \
     && rm /tmp/qdrant.tgz
 
 # ---------------------------------------------------------------------------
-# Python dependencies (same set as the production Dockerfile).
+# Python dependencies: copied in from the builder so no compiler toolchain and
+# no pip cache end up in the runtime image.
 # ---------------------------------------------------------------------------
 WORKDIR /home/user/app
 
-COPY pyproject.toml README.md ./
-RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir .
+COPY --from=python-builder /out /usr/local
 
 # Application code + runtime scripts.
 COPY app ./app
