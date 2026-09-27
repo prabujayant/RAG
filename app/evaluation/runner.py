@@ -17,19 +17,24 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 from app.config import Settings, get_settings
 from app.embeddings import Embedder
 from app.generation.client import LLMClient, MockLLM, OpenRouterClient
-from app.generation.schemas import AnswerResponse, Citation, GroundingStatus
 from app.generation.service import GenerationService
 from app.grounding import GroundingValidator
 from app.retrieval.bm25 import BM25Indexer
+from app.retrieval.evidence import EvidenceSelector
 from app.retrieval.hybrid import HybridRetriever
+from app.retrieval.models import RetrievalResult
 from app.retrieval.reranker import Reranker
 from app.retrieval.vector import VectorStore
 
+from .chunk_refs import ChunkRefResolver
 from .citation_metrics import compute_citation_metrics
 from .datasets import GoldenDataset, GoldenExample, load_golden_dataset
 from .ragas_eval import RagasEvaluator
@@ -48,11 +53,19 @@ class ExperimentConfig:
     """Configuration for a single evaluation experiment."""
 
     experiment_name: str = "final"
+    # Short machine-readable key ("final", "hybrid", ...). Used for result
+    # filenames so tooling can glob `experiment_<key>_*.json`. Kept separate
+    # from `experiment_name`, which is a human-readable label.
+    experiment_key: str = "final"
     use_vector: bool = True
     use_bm25: bool = False
     use_reranker: bool = False
     use_evidence_selector: bool = False
     use_grounding: bool = False
+    # Retrieval-only experiments (A/B/C) do not need generated answers. Skipping
+    # generation keeps ablations fast and free — and avoids conflating retrieval
+    # quality with LLM quality when reading Recall@K / NDCG@K.
+    use_generation: bool = False
     use_ragas: bool = False
     top_k: int = 20
     rerank_top_k: int = 10
@@ -60,16 +73,36 @@ class ExperimentConfig:
 
 
 EXPERIMENTS: dict[str, ExperimentConfig] = {
-    "vector": ExperimentConfig(experiment_name="A — Vector Only", use_vector=True, use_bm25=False),
-    "bm25": ExperimentConfig(experiment_name="B — BM25 Only", use_vector=False, use_bm25=True),
-    "hybrid": ExperimentConfig(experiment_name="C — Hybrid", use_vector=True, use_bm25=True),
+    "vector": ExperimentConfig(
+        experiment_name="A — Vector Only",
+        experiment_key="vector",
+        use_vector=True,
+        use_bm25=False,
+        use_generation=False,
+    ),
+    "bm25": ExperimentConfig(
+        experiment_name="B — BM25 Only",
+        experiment_key="bm25",
+        use_vector=False,
+        use_bm25=True,
+        use_generation=False,
+    ),
+    "hybrid": ExperimentConfig(
+        experiment_name="C — Hybrid",
+        experiment_key="hybrid",
+        use_vector=True,
+        use_bm25=True,
+        use_generation=False,
+    ),
     "final": ExperimentConfig(
         experiment_name="D — Full Pipeline",
+        experiment_key="final",
         use_vector=True,
         use_bm25=True,
         use_reranker=True,
         use_evidence_selector=True,
         use_grounding=True,
+        use_generation=True,
         use_ragas=True,
         top_k=20,
         rerank_top_k=10,
@@ -166,6 +199,8 @@ class EvaluationRunner:
         self._gen_service: GenerationService | None = None
         self._grounding: GroundingValidator | None = None
         self._ragas: RagasEvaluator | None = None
+        self._chunk_refs: ChunkRefResolver | None = None
+        self._evidence_selector: EvidenceSelector | None = None
         # Allow injected mock components for testing
         if _retriever is not None:
             self._retriever = _retriever
@@ -240,9 +275,48 @@ class EvaluationRunner:
         if self._ragas is None and self.cfg.use_ragas:
             self._ragas = RagasEvaluator(disabled=not self.settings.openrouter_api_key, mock=self.mock)
 
+    def _init_evidence_selector(self) -> None:
+        if self._evidence_selector is None and self.cfg.use_evidence_selector:
+            self._evidence_selector = EvidenceSelector(settings=self.settings)
+
     # ------------------------------------------------------------------
     # Per-question evaluation
     # ------------------------------------------------------------------
+
+    def _resolve_expected_chunks(self, example: GoldenExample) -> set[str]:
+        """Map a golden example's slug references to concrete chunk ids.
+
+        Falls back to the raw references when no resolver is available (e.g.
+        unit tests that inject mock components and never touch the database),
+        so behaviour is unchanged in that case.
+        """
+        raw = list(example.relevant_chunk_ids)
+        if not raw:
+            return set()
+        if self._chunk_refs is None:
+            try:
+                self._chunk_refs = ChunkRefResolver.from_database()
+            except Exception as exc:  # pragma: no cover - depends on DB availability
+                logger.warning(
+                    "Could not build chunk-ref resolver (%s); "
+                    "retrieval metrics will compare raw references.",
+                    exc,
+                )
+                self._chunk_refs = ChunkRefResolver()
+        if self._chunk_refs.is_empty:
+            return set(raw)
+        resolved = self._chunk_refs.resolve_all(raw)
+        if not resolved:
+            # Every reference was unresolvable — surface it rather than
+            # silently reporting a zero score.
+            missing = self._chunk_refs.unknown_slugs(raw)
+            logger.warning(
+                "Question %s: no chunk references resolved (unknown slugs: %s)",
+                example.id,
+                sorted(missing),
+            )
+            return set(raw)
+        return resolved
 
     def _evaluate_question(
         self, example: GoldenExample
@@ -250,7 +324,10 @@ class EvaluationRunner:
         """Evaluate a single question through the configured pipeline."""
         qid = example.id
         question = example.question
-        expected_chunks = set(example.relevant_chunk_ids)
+        # The golden dataset references evidence by human-readable slug
+        # (e.g. "authentication-guide:2"); the pipeline emits hash-based ids.
+        # Resolve before comparing, otherwise every retrieval metric is 0.
+        expected_chunks = self._resolve_expected_chunks(example)
         answerable = example.answerable
         start_time = time.perf_counter()
 
@@ -272,35 +349,50 @@ class EvaluationRunner:
                 reranked = self._reranker.rerank(question, retrieved, top_k=self.cfg.rerank_top_k)
                 reranked_chunk_ids = [r.chunk_id for r in reranked]
 
+            # ---- Evidence selection ----
+            # Without this the generator receives every retrieved chunk
+            # (top_k=20), which inflates prompt size and latency. The full
+            # pipeline is supposed to narrow to FINAL_CONTEXT_K chunks.
+            evidence: list[RetrievalResult] = []
+            if self.cfg.use_evidence_selector:
+                self._init_evidence_selector()
+                assert self._evidence_selector is not None
+                pool = reranked if reranked_chunk_ids else retrieved
+                evidence = self._evidence_selector.select(pool)
+
             # ---- Generation + Grounding ----
             generated_answer = ""
             citations: list[dict[str, Any]] = []
             if self.cfg.use_grounding:
                 self._init_grounding()
-                # Build a minimal AnswerResponse from retrieved chunks for validation
+                # Generate a real answer first, then validate it. Passing an
+                # empty answer to the validator would make every citation
+                # metric meaningless (no claims -> nothing to ground).
+                self._init_generation()
+                assert self._gen_service is not None
                 chunks_to_use = reranked_chunk_ids or result.retrieved_chunk_ids
-                chunks_for_grounding = [r for r in retrieved if r.chunk_id in chunks_to_use]
-                response_for_validation = AnswerResponse(
-                    answer="",
-                    citations=[
-                        Citation(citation_id=f"[C{i}]", chunk_id=r.chunk_id, text=r.text)
-                        for i, r in enumerate(chunks_for_grounding, start=1)
-                    ],
-                    grounding_status=GroundingStatus.PARTIALLY_GROUNDED,
-                )
+                chunks_for_grounding = evidence or [
+                    r for r in retrieved if r.chunk_id in chunks_to_use
+                ]
+                gen_output = self._gen_service.generate(question, candidates=chunks_for_grounding)
                 assert self._grounding is not None
-                grounded_response = self._grounding.validate(response_for_validation)
+                grounded_response = self._grounding.validate(gen_output)
                 generated_answer = grounded_response.answer
                 citations = [
                     {"citation_id": c.citation_id, "chunk_id": c.chunk_id, "text": c.text}
                     for c in grounded_response.citations
                 ]
             else:
-                self._init_generation()
-                assert self._gen_service is not None
-                candidates_for_gen = [r for r in retrieved if r.chunk_id in result.retrieved_chunk_ids]
-                gen_output = self._gen_service.generate(question, candidates=candidates_for_gen)
-                generated_answer = gen_output.answer
+                if self.cfg.use_generation:
+                    self._init_generation()
+                    assert self._gen_service is not None
+                    candidates_for_gen = evidence or [
+                        r for r in retrieved if r.chunk_id in result.retrieved_chunk_ids
+                    ]
+                    gen_output = self._gen_service.generate(
+                        question, candidates=candidates_for_gen
+                    )
+                    generated_answer = gen_output.answer
 
             # ---- Citation / Grounding metrics ----
             citation_metrics = compute_citation_metrics(
@@ -393,11 +485,11 @@ class EvaluationRunner:
             all_retrieval.append(qr.retrieval_metrics)
             all_citation.append(qr.citation_metrics)
             if qr.ragas_scores is not None:
-                # RagasResult is a dataclass; extract numeric values
-                for k in ("faithfulness", "answer_correctness", "answer_relevance", "context_precision"):
-                    v = qr.ragas_scores.get(k)
-                    if v is not None:
-                        all_ragas.append({k: float(v)})
+                # RagasResult.to_dict() nests scores as
+                # {"metrics": {name: {"value": v, "error": e}}}. Flatten to
+                # {name: float} so aggregation sees real numbers.
+                for name, score in _iter_ragas_scores(qr.ragas_scores):
+                    all_ragas.append({name: score})
             difficulty = str(qr.example.difficulty.value)
             if difficulty not in per_difficulty:
                 per_difficulty[difficulty] = []
@@ -445,7 +537,7 @@ class EvaluationRunner:
         if output_dir is None:
             output_dir = Path("evals/results/")
         output_dir.mkdir(parents=True, exist_ok=True)
-        out_file = output_dir / f"experiment_{self.cfg.experiment_name}_{experiment_id}.json"
+        out_file = output_dir / f"experiment_{self.cfg.experiment_key}_{experiment_id}.json"
         with open(out_file, "w", encoding="utf-8") as f:
             json.dump(experiment_results.to_dict(), f, indent=2, ensure_ascii=False)
         logger.info(f"Results written to {out_file}")
@@ -456,6 +548,28 @@ class EvaluationRunner:
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
+
+
+def _iter_ragas_scores(ragas_scores: dict[str, Any]) -> Iterator[tuple[str, float]]:
+    """Yield ``(metric_name, value)`` pairs from a serialized RagasResult.
+
+    ``RagasResult.to_dict()`` nests scores as
+    ``{"metrics": {name: {"value": v, "error": e}}}``. This flattens that
+    structure, skipping metrics that errored or produced no numeric value.
+    """
+    metrics = ragas_scores.get("metrics")
+    if not isinstance(metrics, dict):
+        return
+    for name, payload in metrics.items():
+        value: Any = payload
+        if isinstance(payload, dict):
+            value = payload.get("value")
+        if value is None:
+            continue
+        try:
+            yield name, float(value)
+        except (TypeError, ValueError):
+            continue
 
 
 def _aggregate_metric_list(metrics_list: list[dict[str, float]]) -> dict[str, float]:
@@ -483,14 +597,21 @@ def run_evaluation(
     mock: bool = False,
     question_limit: int | None = None,
     output_dir: str | None = None,
+    no_ragas: bool = False,
 ) -> ExperimentResults:
     """
     Convenience wrapper around EvaluationRunner.run().
 
     Loads the default dataset and runs the requested experiment.
+
+    ``no_ragas`` disables the ragas judge. Ragas issues ~15 extra LLM calls per
+    question, which is slow and fragile on free-tier models; disabling it keeps
+    retrieval/citation metrics (the ones that need no judge) intact.
     """
     settings = get_settings()
     dataset = load_golden_dataset(settings.eval_dataset_path)
     runner = EvaluationRunner(experiment=experiment, mock=mock, settings=settings)
+    if no_ragas:
+        runner.cfg.use_ragas = False
     out_path = Path(output_dir) if output_dir else None
     return runner.run(dataset, question_limit=question_limit, output_dir=out_path)

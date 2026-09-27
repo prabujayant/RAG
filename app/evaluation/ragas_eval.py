@@ -12,6 +12,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from pydantic import SecretStr
+
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -62,6 +64,9 @@ class RagasEvaluator:
         self.mock = mock
         self._client: Any = None
         self._evaluator: Any = None
+        self._llm: Any = None
+        self._embeddings: Any = None
+        self._metrics: list[Any] = []
         self._initialized = False
 
     def _initialize(self) -> bool:
@@ -80,7 +85,8 @@ class RagasEvaluator:
             return False
 
         try:
-            from ragas.evaluation import Evaluator
+            from langchain_openai import ChatOpenAI
+            from ragas.llms import LangchainLLMWrapper
             from ragas.metrics import (
                 answer_correctness,
                 answer_relevancy,
@@ -89,15 +95,25 @@ class RagasEvaluator:
                 faithfulness,
             )
 
-            self._evaluator = Evaluator(
-                metrics=[
-                    faithfulness,
-                    answer_correctness,
-                    answer_relevancy,
-                    context_precision,
-                    context_recall,
-                ]
+            # ragas 0.4 dropped the `Evaluator` class in favour of a module-level
+            # `evaluate()` that takes explicit llm/embeddings wrappers.
+            settings = get_settings()
+            judge_llm = ChatOpenAI(
+                model=settings.openrouter_model,
+                api_key=SecretStr(settings.openrouter_api_key),
+                base_url=settings.openrouter_base_url,
+                timeout=settings.llm_timeout_seconds,
+                temperature=0.0,
             )
+            self._llm = LangchainLLMWrapper(judge_llm)
+            self._embeddings = self._build_embeddings()
+            self._metrics = [
+                faithfulness,
+                answer_correctness,
+                answer_relevancy,
+                context_precision,
+                context_recall,
+            ]
             logger.info("RagasEvaluator: initialised successfully")
             return True
         except ImportError as e:
@@ -106,6 +122,34 @@ class RagasEvaluator:
         except Exception as e:
             logger.warning(f"RagasEvaluator: initialisation failed — {e}")
             return False
+
+    def _build_embeddings(self) -> Any:
+        """Build a ragas-compatible embeddings wrapper.
+
+        ``answer_relevancy`` needs embeddings. Prefer the local BGE-M3 model
+        (already downloaded for retrieval, no extra API cost); fall back to
+        OpenAI-compatible embeddings via OpenRouter when unavailable.
+        """
+        settings = get_settings()
+        try:
+            from langchain_community.embeddings import HuggingFaceEmbeddings
+            from ragas.embeddings import LangchainEmbeddingsWrapper
+
+            return LangchainEmbeddingsWrapper(
+                HuggingFaceEmbeddings(model_name=settings.embedding_model)
+            )
+        except Exception as e:
+            logger.warning(f"RagasEvaluator: local embeddings unavailable ({e}); using API embeddings")
+            from langchain_openai import OpenAIEmbeddings
+            from ragas.embeddings import LangchainEmbeddingsWrapper
+
+            return LangchainEmbeddingsWrapper(
+                OpenAIEmbeddings(
+                    model="text-embedding-3-small",
+                    api_key=SecretStr(settings.openrouter_api_key),
+                    base_url=settings.openrouter_base_url,
+                )
+            )
 
     def evaluate(
         self,
@@ -122,7 +166,7 @@ class RagasEvaluator:
             return result
 
         try:
-            from ragas import EvaluationDataset
+            from ragas import EvaluationDataset, evaluate
 
             # Build a ragas-compatible dataset with a single row
             row = {
@@ -131,12 +175,26 @@ class RagasEvaluator:
                 "retrieved_contexts": contexts,
                 "reference": "",  # we don't have ground-truth answers here
             }
-            dataset = EvaluationDataset([row])
+            dataset = EvaluationDataset.from_list([row])
 
-            # Run evaluation
-            scores = self._evaluator.evaluate(dataset)
+            # Run evaluation (ragas 0.4 module-level API)
+            scores = evaluate(
+                dataset,
+                metrics=self._metrics,
+                llm=self._llm,
+                embeddings=self._embeddings,
+                show_progress=False,
+                raise_exceptions=False,
+            )
 
-            # Extract per-metric scores
+            # Extract per-metric scores. `evaluate()` is typed as returning
+            # `EvaluationResult | Executor`; only `EvaluationResult` is produced
+            # here, but narrow explicitly so the union is provably handled.
+            if not hasattr(scores, "to_pandas"):
+                raise TypeError(
+                    f"ragas evaluate() returned {type(scores).__name__}, "
+                    "expected EvaluationResult"
+                )
             score_dict = scores.to_pandas().iloc[0].to_dict()
             metric_names = [
                 "faithfulness",

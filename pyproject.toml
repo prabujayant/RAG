@@ -38,7 +38,14 @@ dependencies = [
     "langfuse>=2.42",
 
     # Evaluation
-    "ragas>=0.2.11",
+    # `RagasEvaluator` is written against the ragas 0.4 API: the module-level
+    # `evaluate()` plus `ragas.llms.LangchainLLMWrapper` /
+    # `ragas.embeddings.LangchainEmbeddingsWrapper` (ragas 0.4 dropped the
+    # `Evaluator` class). Pin to 0.4.x so a fresh install matches the code.
+    # ragas 0.2.x also imports `langchain_community.chat_models.vertexai`,
+    # removed in langchain-community 0.4, hence the upper bound there.
+    "ragas>=0.4,<0.5",
+    "langchain-community<0.4",
     "numpy>=1.26",
     "pandas>=2.2",
 

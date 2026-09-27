@@ -166,7 +166,10 @@ def main() -> int:
         print()
 
     print("=== SUMMARY ===")
-    print(f"{'effort':8s} {'mean acc':>9s} {'perfect':>8s} {'avg s':>7s} {'reasoning tok':>14s} {'markers':>8s}")
+    print(
+        f"{'effort':8s} {'mean acc':>9s} {'perfect':>8s} {'avg s':>7s} "
+        f"{'reasoning tok':>14s} {'markers':>8s}"
+    )
     for eff, s in summary.items():
         print(f"{eff:8s} {s['mean']:9.2f} {s['perfect']:>5d}/6 {s['avg_s']:7.1f} "
               f"{s['avg_reasoning']:14.0f} {s['avg_markers']:8.1f}")

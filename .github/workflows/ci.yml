@@ -1,6 +1,13 @@
 # =============================================================================
-# CI workflow — runs on every PR and push to main.
+# CI/CD workflow — runs on every PR and push to main.
+#
 # Stages: lint → typecheck → unit tests → integration tests → evaluation tests
+#         → docker build → deploy (main only, gated)
+#
+# The `deploy` stage only runs on a push to main, only when the HF_TOKEN secret
+# is configured, and only after every test + the image build succeed. It is
+# additionally gated behind the `production` GitHub Environment, so it can be
+# held for manual approval. PRs from forks never reach it.
 # =============================================================================
 
 name: CI
@@ -262,13 +269,93 @@ jobs:
           retention-days: 7
 
   # --------------------------------------------------------------------------
-  # Stage 7: All tests pass gate
+  # Stage 7: Docker build (validates the production image actually builds)
+  # --------------------------------------------------------------------------
+  # Build-only: nothing is pushed to a registry. This catches Dockerfile
+  # regressions (missing COPY targets, broken deps) that unit tests cannot.
+  docker-build:
+    name: Docker build
+    needs: [lint, typecheck, unit-tests]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build production image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: askmydocs:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test the image
+        run: |
+          docker run --rm --entrypoint python askmydocs:ci -c "
+          import app.main
+          print('app.main imports OK')
+          "
+
+  # --------------------------------------------------------------------------
+  # Stage 8: Deploy to Hugging Face Spaces (main branch only, gated)
+  # --------------------------------------------------------------------------
+  # Guarded three ways:
+  #   1. `if:` — only on a push to main, never on PRs or forks.
+  #   2. `environment: production` — can require manual approval in repo settings.
+  #   3. The HF_TOKEN secret must exist; the step is skipped without it.
+  #
+  # NOTE: this restarts the Space. With INGEST_CORPUS=false the corpus is not
+  # re-ingested, and uploaded documents live in the Space's persistent storage,
+  # so they survive a redeploy. Verify before enabling auto-deploy.
+  deploy:
+    name: Deploy to HF Spaces
+    needs: [docker-build, integration-tests, evaluation-tests]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for HF_TOKEN
+        id: guard
+        run: |
+          if [ -n "${{ secrets.HF_TOKEN }}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "HF_TOKEN not configured — skipping deploy."
+          fi
+
+      - name: Set up Python
+        if: steps.guard.outputs.enabled == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install staging dependencies
+        if: steps.guard.outputs.enabled == 'true'
+        run: pip install huggingface_hub
+
+      - name: Stage and push to Space
+        if: steps.guard.outputs.enabled == 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python scripts/hf_space_stage.py --push Prabu17/askmydocs
+
+  # --------------------------------------------------------------------------
+  # Stage 9: All tests pass gate
   # --------------------------------------------------------------------------
   # This job simply depends on all test jobs and always passes.
   # GitHub branch protection rules should require this job to pass.
   all-tests-pass:
     name: All tests passed
-    needs: [lint, typecheck, unit-tests, integration-tests, evaluation-tests]
+    needs: [lint, typecheck, unit-tests, integration-tests, evaluation-tests, docker-build]
     runs-on: ubuntu-latest
     steps:
       - name: All checks succeeded

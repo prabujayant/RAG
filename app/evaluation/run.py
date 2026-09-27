@@ -74,6 +74,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip post-run regression check even when --baseline is provided",
     )
+    parser.add_argument(
+        "--no-ragas",
+        action="store_true",
+        help=(
+            "Skip the ragas judge. Ragas makes ~15 extra LLM calls per question "
+            "and is slow/fragile on free-tier models. Retrieval and citation "
+            "metrics are unaffected."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -89,6 +98,7 @@ def main() -> None:
             mock=args.mock,
             question_limit=args.question_limit,
             output_dir=args.output,
+            no_ragas=args.no_ragas,
         )
     except Exception as e:
         logger.error(f"Evaluation failed: {e}")

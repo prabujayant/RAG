@@ -7,7 +7,7 @@ PY       ?= python
 PYTEST   ?= $(PY) -m pytest
 UNAME    := $(shell uname -s 2>/dev/null || echo Windows)
 
-.PHONY: help setup install dev deps docker-up docker-down init-db lint format typecheck test test-unit test-integration test-eval test-fast test-coverage eval bench benchmark baseline baseline-update start run worker corpus validate prod-build prod-up prod-down prod-restart prod-health prod-logs prod-logs-worker hf-login hf-stage hf-push hf-clean
+.PHONY: help setup install dev deps docker-up docker-down init-db lint format typecheck test test-unit test-integration test-eval test-fast test-coverage eval eval-ablation perf bench benchmark baseline baseline-update start run worker corpus validate prod-build prod-up prod-down prod-restart prod-health prod-logs prod-logs-worker hf-login hf-stage hf-push hf-clean
 
 help:
 	@echo "AskMyDocs development commands:"
@@ -105,6 +105,17 @@ test-coverage:
 
 eval:
 	$(PY) -m app.evaluation.run
+
+# Retrieval-only ablations (no LLM calls — fast and free). Produces the
+# vector/bm25/hybrid result files that `make benchmark` compares.
+eval-ablation:
+	$(PY) -m app.evaluation.run --experiment vector --no-regression-check
+	$(PY) -m app.evaluation.run --experiment bm25 --no-regression-check
+	$(PY) -m app.evaluation.run --experiment hybrid --no-regression-check
+
+# End-to-end latency / cost / throughput measurement (writes a JSON report).
+perf:
+	$(PY) scripts/measure_performance.py --questions 20 --output evals/reports/performance.json
 
 benchmark:
 	$(PY) scripts/generate_benchmark.py

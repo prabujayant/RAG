@@ -227,7 +227,10 @@ def main() -> int:
             }
         )
 
-    hdr = f"{'model':44s} {'$/1M in/out':>14s} {'json':>5s} {'cited':>6s} {'empty':>6s} {'claims':>7s} {'avg s':>6s} {'$/query':>9s}"
+    hdr = (
+        f"{'model':44s} {'$/1M in/out':>14s} {'json':>5s} {'cited':>6s} "
+        f"{'empty':>6s} {'claims':>7s} {'avg s':>6s} {'$/query':>9s}"
+    )
     print(hdr)
     print("-" * len(hdr))
     for r in rows:
