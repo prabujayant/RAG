@@ -74,7 +74,10 @@ def _parse_llm_judge_response(raw: str | None) -> dict | None:
     (chain-of-thought preamble followed by the JSON payload) is handled the
     same way as answer generation. Never raises on ``None`` input.
     """
-    parsed = safe_parse_json(extract_json(raw))
+    payload = extract_json(raw)
+    if payload is None:
+        return None
+    parsed = safe_parse_json(payload)
     return parsed if isinstance(parsed, dict) else None
 
 

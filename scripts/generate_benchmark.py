@@ -18,18 +18,21 @@ REPORT_PATH = ROOT / "evals" / "reports" / "benchmark.md"
 EXPERIMENTS = ["vector", "bm25", "hybrid", "final"]
 
 
-def _load_results(experiment: str) -> dict | None:
+def _load_results(experiment: str, results_dir: str | Path | None = None) -> dict | None:
     """Load the latest results JSON for the given experiment name.
 
     Results are saved to evals/results/experiment_{experiment}_{id}.json
     (e.g. experiment_final_a1b2c3d4.json), so we glob for that pattern
     directly rather than looking in a subdirectory.
+
+    ``results_dir`` overrides the default ``evals/results`` location.
     """
-    if not RESULTS_DIR.exists():
+    root = Path(results_dir) if results_dir else RESULTS_DIR
+    if not root.exists():
         return None
     # Find all JSON files matching the experiment pattern and pick the latest
     pattern = f"experiment_{experiment}_*.json"
-    files = sorted(RESULTS_DIR.glob(pattern), key=lambda p: p.stat().st_mtime)
+    files = sorted(root.glob(pattern), key=lambda p: p.stat().st_mtime)
     if not files:
         return None
     return json.loads(files[-1].read_text(encoding="utf-8"))
@@ -53,7 +56,15 @@ def _table_header(cols: list[str]) -> str:
     return "| " + " | ".join(cols) + " |\n" + "| " + " | ".join("---" for _ in cols) + " |"
 
 
-def main() -> int:
+def generate_report(results_dir: str | Path | None = None) -> Path:
+    """Render ``evals/reports/benchmark.md`` from the experiment result files.
+
+    Returns the path the report was written to. Callers that only need the
+    artifact (e.g. the Celery task) should use this; ``main()`` is the CLI
+    wrapper around it.
+
+    ``results_dir`` overrides the default ``evals/results`` location.
+    """
     REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     lines: list[str] = [
@@ -69,7 +80,7 @@ def main() -> int:
 
     experiments_data: dict[str, dict] = {}
     for exp in EXPERIMENTS:
-        data = _load_results(exp)
+        data = _load_results(exp, results_dir)
         if data is None:
             lines.append(
                 _table_row([exp, "—", "—", "—", "—", "—", "No results found"])
@@ -129,7 +140,12 @@ def main() -> int:
 
     lines.append("")
     REPORT_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"Benchmark written to {REPORT_PATH}")
+    return REPORT_PATH
+
+
+def main() -> int:
+    report_path = generate_report()
+    print(f"Benchmark written to {report_path}")
     return 0
 
 

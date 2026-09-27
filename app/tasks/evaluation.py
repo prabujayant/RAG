@@ -34,42 +34,43 @@ def run_evaluation(
     """
     import time
 
-    from app.evaluation.runner import EvaluationRunner
+    from app.evaluation.runner import EvaluationRunner, load_golden_dataset
 
     start = time.monotonic()
 
     settings = get_settings()
-    dataset = dataset_path or settings.eval_dataset_path
+    dataset_file = dataset_path or settings.eval_dataset_path
     name = experiment_name or f"experiment_{self.request.id}"
 
     try:
-        runner = EvaluationRunner(mock=mock)
-        result = runner.run(dataset_path=dataset)
+        dataset = load_golden_dataset(dataset_file)
+        runner = EvaluationRunner(experiment=name, mock=mock, settings=settings)
+        result = runner.run(dataset)
 
         duration = time.monotonic() - start
-        summary = result.get("summary", {})
+        retrieval = result.aggregate_retrieval
+        citation = result.aggregate_citation
         logger.info(
             "run_evaluation completed",
             extra={
                 "experiment": name,
-                "passed": summary.get("questions_passed", 0),
-                "total": summary.get("total_questions", 0),
+                "total": result.question_count,
                 "duration": duration,
             },
         )
 
         return {
             "status": "success",
-            "experiment_name": name,
-            "questions_passed": summary.get("questions_passed", 0),
-            "total_questions": summary.get("total_questions", 0),
-            "retrieval_precision": summary.get("retrieval_precision"),
-            "retrieval_recall": summary.get("retrieval_recall"),
-            "citation_precision": summary.get("citation_precision"),
-            "citation_recall": summary.get("citation_recall"),
-            "grounding_accuracy": summary.get("grounding_accuracy"),
+            "experiment_name": result.experiment_name,
+            "questions_passed": sum(1 for q in result.question_results if not q.error),
+            "total_questions": result.question_count,
+            "retrieval_precision": retrieval.get("precision_at_k"),
+            "retrieval_recall": retrieval.get("recall_at_k"),
+            "citation_precision": citation.get("citation_precision"),
+            "citation_completeness": citation.get("citation_completeness"),
+            "grounded_answer_rate": citation.get("grounded_answer_rate"),
             "duration_seconds": round(duration, 2),
-            "results_path": result.get("results_path"),
+            "results_path": result.dataset_path,
         }
     except Exception as exc:
         logger.exception("run_evaluation failed")
