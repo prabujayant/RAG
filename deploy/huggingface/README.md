@@ -161,6 +161,47 @@ cd hf_staging && docker build -t askmydocs-hf .
 python scripts/hf_space_stage.py --push username/space-name
 ```
 
+Always re-stage before pushing. `hf_staging/` is a build artefact and goes stale;
+pushing a stale directory silently ships old code.
+
+### CI auto-deploy
+
+`.github/workflows/ci.yml` deploys to `Prabu17/askmydocs` on every push to `main`,
+gated by the `production` environment and the `HF_TOKEN` secret. It waits for the
+Space to reach `RUNNING` and polls `/health` before reporting success, so a failed
+remote build fails the CI run instead of leaving the site silently down.
+
+Deploy is deliberately **not** gated on `evaluation-tests`: evaluation quality is not
+a runtime-correctness gate, and a metrics-library bump must not be able to take the
+live site down.
+
+### Image size: keep the runtime image small
+
+Free `cpu-basic` builds run in a fixed memory budget. If the image gets too large the
+remote build is **OOMKilled (exit 137)** — usually while pushing the image, so the
+symptom is a generic build error with no failing step.
+
+Two rules keep it in budget:
+
+1. **Anything the served app needs must be in `[project] dependencies`, not an extra.**
+   The Space installs the base list only (`pip install .`). Extras such as `eval`
+   (ragas + langchain) are deliberately *not* installed there — `RagasEvaluator`
+   imports them lazily and degrades to "skipped" when absent.
+2. **torch must be CPU-only.** The default PyPI Linux wheel bundles the CUDA stack
+   (nvidia-cublas, cudnn, nccl — several GB) that a CPU-only Space never uses. The
+   Dockerfile installs torch first from `download.pytorch.org/whl/cpu` so the
+   project install does not re-resolve it.
+
+Watch out for floating version ranges: `torch>=2.2` resolved to a much larger wheel
+in Sept 2026 than it had in the same month earlier, which OOMKilled the build with no
+repo change at all. Bump carefully and re-verify a Space build after any dependency
+change.
+
+> Note: free `cpu-basic` does not stream build logs ("Failed to retrieve error logs:
+> SSE is not enabled"), so a build failure gives you only the exit code. Diagnose by
+> elimination — e.g. push a strict subset of the previous dependencies — rather than
+> assuming the newest diff is at fault.
+
 ## State Backup
 
 Back up the current state (Postgres, Qdrant, uploads) to a Storage Bucket:

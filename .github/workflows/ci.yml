@@ -314,12 +314,17 @@ jobs:
   #   2. `environment: production` — can require manual approval in repo settings.
   #   3. The HF_TOKEN secret must exist; the step is skipped without it.
   #
+  # `needs` deliberately EXCLUDES `evaluation-tests`. Evaluation quality is not
+  # a runtime-correctness gate, and a metrics-library bump should never be able
+  # to take the live site down. Evals still run in this same workflow and still
+  # gate the `all-tests-pass` aggregate (and therefore branch protection).
+  #
   # NOTE: this restarts the Space. With INGEST_CORPUS=false the corpus is not
   # re-ingested, and uploaded documents live in the Space's persistent storage,
   # so they survive a redeploy. Verify before enabling auto-deploy.
   deploy:
     name: Deploy to HF Spaces
-    needs: [docker-build, integration-tests, evaluation-tests]
+    needs: [docker-build, integration-tests]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: production
@@ -352,6 +357,61 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python scripts/hf_space_stage.py --push Prabu17/askmydocs
+
+      # A successful upload is NOT a successful deploy. The push only commits
+      # files; HF then builds remotely, and a build can still fail (e.g. the
+      # exit-137 OOM that took the Space down three times in Sept 2026). Without
+      # this poll, that failure is invisible in CI and the site is simply down.
+      - name: Wait for Space build and verify it serves
+        if: steps.guard.outputs.enabled == 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SPACE_ID: Prabu17/askmydocs
+          SPACE_URL: https://prabu17-askmydocs.hf.space
+        run: |
+          set -euo pipefail
+          pip install --quiet huggingface_hub
+          python - <<'PY'
+          import os, time
+          from huggingface_hub import HfApi
+
+          space = os.environ["SPACE_ID"]
+          token = os.environ.get("HF_TOKEN") or None
+          api = HfApi(token=token)
+
+          deadline = time.time() + 45 * 60
+          stage = "unknown"
+          while time.time() < deadline:
+              stage = api.space_info(space).runtime.stage
+              print(f"stage={stage}", flush=True)
+              if stage in ("RUNNING", "BUILD_ERROR", "RUNTIME_ERROR"):
+                  break
+              time.sleep(30)
+          else:
+              raise SystemExit(f"timed out waiting for {space} (last stage={stage})")
+
+          if stage != "RUNNING":
+              raise SystemExit(
+                  f"{space} did not reach RUNNING (stage={stage}). "
+                  "Check the build logs on the Space page."
+              )
+          print(f"{space} is RUNNING")
+          PY
+
+          # APP_STARTING can still briefly 502 behind the HF proxy, so retry
+          # the health check for a few minutes before failing the job.
+          for i in $(seq 1 20); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 \
+                   "${SPACE_URL}/health" || true)
+            echo "health attempt ${i}: ${code}"
+            if [ "$code" = "200" ]; then
+              echo "Space is serving"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::Space reached RUNNING but /health never returned 200"
+          exit 1
 
   # --------------------------------------------------------------------------
   # Stage 9: All tests pass gate
