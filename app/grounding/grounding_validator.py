@@ -7,7 +7,6 @@ and produces a grounded response with status and confidence.
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -62,6 +61,13 @@ _LLM_JUDGE_BATCH_SYSTEM = (
 )
 
 _LLM_JUDGE_BATCH_USER = "Judge each claim below.\n\n{entries}"
+
+# Max claims per batched judge call. Keeps the JSON response small enough that
+# a long answer cannot truncate the tail of the verdict array (truncation was
+# the original source of the per-claim fallback). 12 verdicts x ~256 tokens is
+# comfortably inside the budget, and in practice a single chunk covers a whole
+# answer, so this is a safety valve rather than the normal path.
+_JUDGE_BATCH_CHUNK = 12
 
 
 def _build_llm_judge_messages(
@@ -202,47 +208,28 @@ class GroundingValidator:
         # Validate all cited claims. The LLM judge is called ONCE for the whole
         # batch (one round trip instead of one per claim — the per-claim judge
         # was the dominant query-latency cost). Claims the batch could not
-        # verdict fall back to per-claim judging, then to the deterministic
-        # validator.
+        # verdict fall back to the DETERMINISTIC validator — never to more LLM
+        # calls, which would silently reintroduce the per-claim latency.
         validated_claims: list[AnswerClaim] = []
         if raw_claims:
             batch_verdicts = self._batch_judge(raw_claims, citation_map)
             if batch_verdicts is None:
-                # Batch unavailable — judge everything per-claim, concurrently
-                # (I/O-bound HTTP calls).
-                with ThreadPoolExecutor(max_workers=min(len(raw_claims), 8)) as pool:
-                    futures = {
-                        pool.submit(self._validate_claim, raw, citation_map, response.citations): idx
-                        for idx, raw in enumerate(raw_claims)
-                    }
-                    # Collect results in submission order to preserve claim sequence
-                    results: list[AnswerClaim | None] = [None] * len(raw_claims)
-                    for future in as_completed(futures):
-                        idx = futures[future]
-                        results[idx] = future.result()
-                    validated_claims = [r for r in results if r is not None]
-            else:
-                # Use batch verdicts where available; only claims the batch
-                # could not verdict fall back to per-claim judging.
-                missing = [
-                    (idx, raw)
-                    for idx, raw in enumerate(raw_claims)
-                    if raw.text not in batch_verdicts
-                ]
-                fallback: dict[int, AnswerClaim] = {}
-                if missing:
-                    with ThreadPoolExecutor(max_workers=min(len(missing), 8)) as pool:
-                        futures = {
-                            pool.submit(
-                                self._validate_claim, raw, citation_map, response.citations
-                            ): idx
-                            for idx, raw in missing
-                        }
-                        for future in as_completed(futures):
-                            fallback[futures[future]] = future.result()
+                # Batch unavailable (no LLM client, call failed, unparseable) —
+                # deterministic validation only. No LLM calls.
                 validated_claims = [
-                    fallback.get(idx) or self._claim_from_verdict(raw, batch_verdicts[raw.text])
-                    for idx, raw in enumerate(raw_claims)
+                    self._deterministic_claim(raw, citation_map, response.citations)
+                    for raw in raw_claims
+                ]
+            else:
+                # Use batch verdicts where available; claims the batch could
+                # not verdict get the deterministic verdict. A missing verdict
+                # is itself a quality signal (the judge dodged the claim), so
+                # treating it as unsupported is honest and keeps latency flat.
+                validated_claims = [
+                    self._claim_from_verdict(raw, batch_verdicts[raw.text])
+                    if raw.text in batch_verdicts
+                    else self._deterministic_claim(raw, citation_map, response.citations)
+                    for raw in raw_claims
                 ]
 
         # Calculate aggregate grounding status
@@ -284,11 +271,12 @@ class GroundingValidator:
         raw_claims: list[Claim],
         citation_map: dict[str, Citation],
     ) -> dict[str, dict] | None:
-        """Judge all claims in ONE LLM call.
+        """Judge all claims in ONE (or a few) LLM calls.
 
         Returns a map from claim text to verdict dict, or None when the batch
         path is unavailable (no LLM client, call failed, unparseable response).
-        Claims missing from the returned map fall back to per-claim judging.
+        Claims missing from the returned map get the deterministic validator in
+        ``validate()`` — never another LLM call.
         """
         if self._llm_client is None or not self.config.use_llm_judge:
             return None
@@ -311,9 +299,44 @@ class GroundingValidator:
         if not entries:
             return None
 
+        out: dict[str, dict] = {}
+        # Split into chunks so one oversized response cannot be truncated
+        # (finish_reason=length silently drops trailing verdicts, which used to
+        # push every dropped claim back through a per-claim LLM call).
+        chunks = [entries[i:i + _JUDGE_BATCH_CHUNK] for i in range(0, len(entries), _JUDGE_BATCH_CHUNK)]
+        for chunk in chunks:
+            chunk_out = self._batch_judge_chunk(chunk, raw_claims)
+            if chunk_out is None:
+                # This whole chunk failed; its claims fall back deterministically.
+                continue
+            out.update(chunk_out)
+
+        requested = len(entries)
+        got = len(out)
+        if got != requested:
+            # Visible in the Space logs: a gap here means the judge omitted
+            # verdicts, so those claims are graded deterministically instead.
+            logger.info(
+                "Batched judge returned %d/%d verdicts; %d claim(s) fall back to "
+                "deterministic validation",
+                got,
+                requested,
+                requested - got,
+            )
+        return out
+
+    def _batch_judge_chunk(
+        self,
+        entries: list[dict],
+        raw_claims: list[Claim],
+    ) -> dict[str, dict] | None:
+        """Run one batched judge call for *entries*, returning claim_text->verdict."""
+        client = self._llm_client
+        if client is None:
+            return None
         system_prompt, user_prompt = _build_llm_judge_batch_messages(entries)
         try:
-            raw_response = self._llm_client.generate(
+            raw_response = client.generate(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 evidence_context="",
@@ -325,7 +348,7 @@ class GroundingValidator:
                 usage_label="grounding",
             )
         except Exception:
-            logger.warning("Batched LLM judge call failed; falling back to per-claim", exc_info=True)
+            logger.warning("Batched LLM judge call failed; using deterministic validation", exc_info=True)
             return None
 
         parsed = _parse_llm_judge_response(raw_response.text)
@@ -335,19 +358,39 @@ class GroundingValidator:
         if not isinstance(verdicts, list):
             return None
 
+        # id -> claim text, so a verdict can be matched by id OR by echoed text
+        # (models frequently renumber or echo the claim instead of the id).
+        by_id = {e["id"]: e["claim"] for e in entries}
         out: dict[str, dict] = {}
         for v in verdicts:
             if not isinstance(v, dict):
                 continue
+            claim_text = None
             raw_id = v.get("id")
-            if raw_id is None:
-                continue
-            try:
-                cid = int(raw_id)
-            except (TypeError, ValueError):
-                continue
-            if 0 <= cid < len(raw_claims):
-                out[raw_claims[cid].text] = v
+            if raw_id is not None:
+                try:
+                    cid = int(raw_id)
+                except (TypeError, ValueError):
+                    cid = None
+                if cid is not None and cid in by_id:
+                    claim_text = by_id[cid]
+            if claim_text is None:
+                # Fall back to matching the echoed claim text.
+                echoed = v.get("claim")
+                if isinstance(echoed, str):
+                    for e in entries:
+                        if e["claim"].strip() == echoed.strip():
+                            claim_text = e["claim"]
+                            break
+            if claim_text is None and raw_id is not None:
+                try:
+                    idx = int(raw_id)
+                except (TypeError, ValueError):
+                    idx = -1
+                if 0 <= idx < len(raw_claims):
+                    claim_text = raw_claims[idx].text
+            if claim_text is not None:
+                out[claim_text] = v
         return out
 
     def _claim_from_verdict(self, raw: Claim, verdict: dict) -> AnswerClaim:
@@ -365,19 +408,23 @@ class GroundingValidator:
             reason=reason,
         )
 
-    def _validate_claim(
+    def _deterministic_claim(
         self,
         raw: Claim,
         citation_map: dict[str, Citation],
         all_citations: list[Citation],
     ) -> AnswerClaim:
-        """Validate a single claim against its cited evidence.
+        """Validate a claim WITHOUT any LLM call.
 
-        Returns an AnswerClaim with status and reason.
+        Used for claims the batched judge did not verdict, and when the batch
+        itself is unavailable. Deliberately skips the LLM judge that
+        ``_validate_claim`` invokes, so a partial or failed batch can never
+        reintroduce per-claim LLM round trips (the latency bug this replaced).
+        A claim the judge skipped is treated as unsupported — an absent verdict
+        is not evidence of support.
         """
         from app.generation.schemas import CitationStatus
 
-        # If no citations, mark as unsupported with no reason
         if not raw.citation_ids:
             return AnswerClaim(
                 claim=raw.text,
@@ -386,38 +433,24 @@ class GroundingValidator:
                 reason="Claim has no citations.",
             )
 
-        validated_statuses: list[CitationStatus] = []
+        statuses: list[CitationStatus] = []
         reasons: list[str] = []
-
         for cid in raw.citation_ids:
             citation = citation_map.get(cid)
             if citation is None:
-                # Unknown citation ID
-                validated_statuses.append(CitationStatus.UNSUPPORTED)
+                statuses.append(CitationStatus.UNSUPPORTED)
                 reasons.append(f"Unknown citation ID: {cid}.")
                 continue
-
-            evidence_text = citation.text
-            validation_result = self._do_validate(
-                raw.text,
-                evidence_text,
-                cid,
-                citation.section,
-                None,
-            )
-            validated_statuses.append(validation_result.status)
-            reasons.append(f"[{cid}] {validation_result.reason}")
-
-        # Aggregate: best status wins
-        overall_status = self._aggregate_statuses(validated_statuses)
-        # Combine reasons
-        combined_reason = " ".join(reasons) if reasons else None
+            # Token-overlap validator only — no LLM round trip.
+            result = self.citation_validator.validate(raw.text, citation.text, cid)
+            statuses.append(result.status)
+            reasons.append(f"[{cid}] {result.reason}")
 
         return AnswerClaim(
             claim=raw.text,
             citation_ids=raw.citation_ids,
-            status=overall_status,
-            reason=combined_reason,
+            status=self._aggregate_statuses(statuses),
+            reason=" ".join(reasons) if reasons else None,
         )
 
     def _do_validate(

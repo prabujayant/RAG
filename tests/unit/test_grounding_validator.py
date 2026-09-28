@@ -350,8 +350,11 @@ class TestBatchedLLMJudge:
         result = validator.validate(response)
         assert result.grounding_status in list(GroundingStatus)
 
-    def test_batch_partial_verdicts_fall_back_per_claim(self) -> None:
-        # Batch returns only claim 0's verdict; claim 1 must be judged per-claim.
+    def test_batch_partial_verdicts_do_not_re_judge(self) -> None:
+        # Batch returns only claim 0's verdict. Claim 1 must be graded
+        # DETERMINISTICALLY, not via a second LLM call: a missing verdict is
+        # not evidence of support, and re-judging per claim is what made
+        # grounding cost one LLM round trip per claim.
         mock_llm = MockLLM(
             response_text=(
                 '{"verdicts": ['
@@ -369,9 +372,50 @@ class TestBatchedLLMJudge:
             ],
         )
         result = validator.validate(response)
-        # 1 batch call + 1 per-claim fallback call for the missing verdict.
-        assert len(mock_llm.calls) == 2
+        # Exactly ONE LLM call: the missing verdict is not re-requested.
+        assert len(mock_llm.calls) == 1
         assert len(result.claims) == 2
+        assert result.claims[0].status == CitationStatus.SUPPORTED
+
+    def test_batch_matches_verdicts_by_claim_text(self) -> None:
+        # Some models echo the claim instead of returning the id. The verdict
+        # must still attach to the right claim rather than being dropped (and
+        # then re-judged) because the id did not round-trip.
+        mock_llm = MockLLM(
+            response_text=(
+                '{"verdicts": ['
+                '{"claim": "Tokens expire", "status": "supported", '
+                '"score": 0.9, "reason": "ok"}]}'
+            )
+        )
+        config = GroundingConfig(use_llm_judge=True)
+        validator = GroundingValidator(config=config, llm_client=mock_llm)
+        response = _make_response(
+            "Tokens expire [C1].",
+            [_make_citation("[C1]", "auth:0", "Access tokens expire after 60 minutes.")],
+        )
+        result = validator.validate(response)
+        assert len(mock_llm.calls) == 1
+        assert result.claims[0].status == CitationStatus.SUPPORTED
+
+    def test_batch_chunks_large_claim_sets(self) -> None:
+        # A long answer is split so one response cannot truncate the tail of
+        # the verdict array. 5 substantive claims fit in the 12-per-chunk cap,
+        # so this stays a single LLM call.
+        mock_llm = MockLLM(response_text='{"verdicts": []}')
+        config = GroundingConfig(use_llm_judge=True)
+        validator = GroundingValidator(config=config, llm_client=mock_llm)
+        claims = " ".join(
+            f"Access tokens expire after {i * 10} minutes [C1]." for i in range(1, 6)
+        )
+        response = _make_response(
+            claims,
+            [_make_citation("[C1]", "auth:0", "Access tokens expire after 60 minutes.")],
+        )
+        result = validator.validate(response)
+        assert len(result.claims) == 5
+        # 5 claims fit in one chunk -> exactly one call.
+        assert len(mock_llm.calls) == 1
 
     def test_batch_not_used_when_judge_disabled(self) -> None:
         mock_llm = MockLLM(response_text='{"verdicts": []}')
