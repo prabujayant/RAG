@@ -75,7 +75,22 @@ RUN curl -fsSL \
 WORKDIR /home/user/app
 
 COPY pyproject.toml README.md ./
-RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir .
+
+# torch MUST come from the CPU-only index. The default PyPI linux wheel pulls
+# the whole CUDA stack (nvidia-cublas, cudnn, nccl, ...) — several GB a CPU-only
+# Space can never use. This is what OOMKilled (exit 137) the free cpu-basic
+# build: floating `torch>=2.2` kept resolving to newer, larger wheels over time
+# even with no repo changes.
+#
+# torch is installed FIRST, into the real site-packages (no --prefix trick), so
+# the project install below sees it already satisfying `torch>=2.2` and does
+# not re-resolve it against PyPI.
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir \
+        --index-url https://download.pytorch.org/whl/cpu \
+        --extra-index-url https://pypi.org/simple \
+        "torch>=2.2"
+RUN pip install --no-cache-dir .
 
 # Application code + runtime scripts.
 COPY app ./app
