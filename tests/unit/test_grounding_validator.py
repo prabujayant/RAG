@@ -308,3 +308,78 @@ class TestGroundingValidatorLLMJudge:
         )
         validator.validate(response)
         assert len(mock_llm.calls) == 0
+
+
+class TestBatchedLLMJudge:
+    """The batched judge validates all claims in ONE LLM call."""
+
+    def test_batch_call_single_llm_round_trip(self) -> None:
+        mock_llm = MockLLM(
+            response_text=(
+                '{"verdicts": ['
+                '{"id": 0, "status": "supported", "score": 0.9, "reason": "ok"},'
+                '{"id": 1, "status": "unsupported", "score": 0.1, "reason": "invented"}]'
+                "}"
+            )
+        )
+        config = GroundingConfig(use_llm_judge=True)
+        validator = GroundingValidator(config=config, llm_client=mock_llm)
+        response = _make_response(
+            "Tokens expire after 60 minutes [C1]. Admins can rotate keys [C2].",
+            [
+                _make_citation("[C1]", "auth:0", "Access tokens expire after 60 minutes."),
+                _make_citation("[C2]", "auth:1", "Admins rotate API keys in the console."),
+            ],
+        )
+        result = validator.validate(response)
+        # ONE batched call instead of one per claim.
+        assert len(mock_llm.calls) == 1
+        assert len(result.claims) == 2
+        assert result.claims[0].status == CitationStatus.SUPPORTED
+        assert result.claims[1].status == CitationStatus.UNSUPPORTED
+
+    def test_batch_falls_back_to_per_claim_on_bad_response(self) -> None:
+        mock_llm = MockLLM(response_text="not json at all")
+        config = GroundingConfig(use_llm_judge=True)
+        validator = GroundingValidator(config=config, llm_client=mock_llm)
+        response = _make_response(
+            "Something [C1].",
+            [_make_citation("[C1]", "auth:0", "Access tokens expire.")],
+        )
+        # Must not crash; falls back to the deterministic validator.
+        result = validator.validate(response)
+        assert result.grounding_status in list(GroundingStatus)
+
+    def test_batch_partial_verdicts_fall_back_per_claim(self) -> None:
+        # Batch returns only claim 0's verdict; claim 1 must be judged per-claim.
+        mock_llm = MockLLM(
+            response_text=(
+                '{"verdicts": ['
+                '{"id": 0, "status": "supported", "score": 0.9, "reason": "ok"}]'
+                "}"
+            )
+        )
+        config = GroundingConfig(use_llm_judge=True)
+        validator = GroundingValidator(config=config, llm_client=mock_llm)
+        response = _make_response(
+            "Tokens expire [C1]. Keys rotate [C2].",
+            [
+                _make_citation("[C1]", "auth:0", "Access tokens expire after 60 minutes."),
+                _make_citation("[C2]", "auth:1", "Admins rotate API keys."),
+            ],
+        )
+        result = validator.validate(response)
+        # 1 batch call + 1 per-claim fallback call for the missing verdict.
+        assert len(mock_llm.calls) == 2
+        assert len(result.claims) == 2
+
+    def test_batch_not_used_when_judge_disabled(self) -> None:
+        mock_llm = MockLLM(response_text='{"verdicts": []}')
+        config = GroundingConfig(use_llm_judge=False)
+        validator = GroundingValidator(config=config, llm_client=mock_llm)
+        response = _make_response(
+            "Something [C1].",
+            [_make_citation("[C1]", "auth:0", "Access tokens expire.")],
+        )
+        validator.validate(response)
+        assert len(mock_llm.calls) == 0

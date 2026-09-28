@@ -22,6 +22,9 @@ MODEL_PRICES_USD_PER_M: dict[str, tuple[float, float]] = {
     "nex-agi/nex-n2.5-pro": (0.0, 0.0),
     "liquid/lfm-2.5-2.6b": (0.0, 0.0),
     "z-ai/glm-5.2": (0.0, 0.0),
+    # Verified against the OpenRouter listing for z-ai/glm-5.3-flash
+    # ($0.15/1M prompt, $0.50/1M completion).
+    "z-ai/glm-5.3-flash": (0.15, 0.50),
     "openai/gpt-4o-mini": (0.15, 0.60),
     "openai/gpt-4o": (2.50, 10.00),
     "anthropic/claude-3-5-haiku": (0.80, 4.00),
